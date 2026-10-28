@@ -68,6 +68,12 @@ fn default_max_turns() -> usize {
 pub struct McpServerConfig {
     /// Streamable HTTP endpoint for the MCP server.
     pub url: String,
+    /// Environment variable containing a bearer token for this server.
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    /// If set, only these discovered tool names are registered.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl Config {
@@ -102,6 +108,26 @@ impl Config {
             for server in &a.mcp_servers {
                 if server.url.trim().is_empty() {
                     bail!("agent '{}' has an MCP server with an empty url", a.name);
+                }
+                if server
+                    .bearer_token_env
+                    .as_deref()
+                    .is_some_and(|name| name.trim().is_empty())
+                {
+                    bail!(
+                        "agent '{}' has an MCP server with an empty bearer_token_env",
+                        a.name
+                    );
+                }
+                if server
+                    .allowed_tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.iter().any(|name| name.trim().is_empty()))
+                {
+                    bail!(
+                        "agent '{}' has an MCP allowlist with an empty tool name",
+                        a.name
+                    );
                 }
             }
         }
@@ -203,5 +229,26 @@ preamble = "Be brief."
             .unwrap_err()
             .to_string()
             .contains("request_timeout_seconds"));
+    }
+
+    #[test]
+    fn parses_mcp_auth_and_tool_allowlist() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n[[agents.mcp_servers]]\nurl=\"http://localhost/mcp\"\nbearer_token_env=\"MCP_TOKEN\"\nallowed_tools=[\"search\", \"read\"]\n";
+        let cfg = Config::parse(raw).expect("MCP policy should parse");
+        let server = &cfg.agents[0].mcp_servers[0];
+        assert_eq!(server.bearer_token_env.as_deref(), Some("MCP_TOKEN"));
+        assert_eq!(
+            server.allowed_tools.as_deref(),
+            Some(["search".to_string(), "read".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn rejects_empty_mcp_allowlist_tool() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n[[agents.mcp_servers]]\nurl=\"http://localhost/mcp\"\nallowed_tools=[\" \"]\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("empty tool name"));
     }
 }

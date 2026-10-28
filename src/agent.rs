@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use rig::prelude::*;
 use rig::providers::{ollama, openai};
-use std::collections::HashMap;
+use rig::tool::{server::ToolServerHandle, DynamicTool};
+use rig_core::tool::managed::{ManagedToolSink, ManagedToolToken};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{AgentConfig, McpServerConfig, Provider};
@@ -98,21 +100,147 @@ async fn connect_mcp(
 ) -> Result<Box<dyn Send>> {
     use rig::tool::rmcp::{
         rmcp::{
-            model::{ClientCapabilities, ClientInfo, Implementation},
+            model::{ClientCapabilities, ClientConfig, Implementation},
             transport::StreamableHttpClientTransport,
         },
         McpClientHandler,
     };
 
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("riggate", env!("CARGO_PKG_VERSION")),
     );
-    let handler = McpClientHandler::new(client_info, tool_server.clone());
-    let transport = StreamableHttpClientTransport::from_uri(server.url.clone());
+    let allowlist = server
+        .allowed_tools
+        .as_ref()
+        .map(|tools| tools.iter().cloned().collect());
+    let sink = FilteredToolSink {
+        inner: tool_server.clone(),
+        allowlist,
+    };
+    let handler = McpClientHandler::new(client_info, sink);
+    let token = server
+        .bearer_token_env
+        .as_deref()
+        .map(read_mcp_token)
+        .transpose()?;
+    let transport_config = mcp_transport_config(server.url.clone(), token)?;
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
     let connection = handler
         .connect(transport)
         .await
         .with_context(|| format!("MCP connection to {} failed", server.url))?;
     Ok(Box::new(connection))
+}
+
+struct FilteredToolSink {
+    inner: ToolServerHandle,
+    allowlist: Option<HashSet<String>>,
+}
+
+impl FilteredToolSink {
+    fn filter(&self, tools: Vec<DynamicTool>) -> Vec<DynamicTool> {
+        tools
+            .into_iter()
+            .filter(|tool| tool_allowed(self.allowlist.as_ref(), &tool.name().to_string()))
+            .collect()
+    }
+}
+
+impl ManagedToolSink for FilteredToolSink {
+    fn add_managed_tools(&self, tools: Vec<DynamicTool>) -> HashMap<String, ManagedToolToken> {
+        self.inner.add_managed_tools(self.filter(tools))
+    }
+
+    fn reconcile_managed_tools(
+        &self,
+        expected: HashMap<String, ManagedToolToken>,
+        tools: Vec<DynamicTool>,
+    ) -> HashMap<String, ManagedToolToken> {
+        self.inner
+            .reconcile_managed_tools(expected, self.filter(tools))
+    }
+}
+
+fn tool_allowed(allowlist: Option<&HashSet<String>>, name: &str) -> bool {
+    allowlist.is_none_or(|allowed| allowed.contains(name))
+}
+
+fn read_mcp_token(variable: &str) -> Result<String> {
+    let token = std::env::var(variable)
+        .with_context(|| format!("reading MCP bearer token from {variable}"))?;
+    if token.is_empty() {
+        anyhow::bail!("MCP bearer token environment variable {variable} is empty");
+    }
+    Ok(token)
+}
+
+fn mcp_transport_config(
+    url: String,
+    token: Option<String>,
+) -> Result<
+    rig::tool::rmcp::rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig,
+> {
+    use rig::tool::rmcp::rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+    let config = StreamableHttpClientTransportConfig::with_uri(url);
+    match token {
+        Some(token) if token.is_empty() => anyhow::bail!("MCP bearer token cannot be empty"),
+        Some(token) => Ok(config.auth_header(token)),
+        None => Ok(config),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_all_tools_when_no_allowlist_is_configured() {
+        assert!(tool_allowed(None, "anything"));
+    }
+
+    #[test]
+    fn allowlist_matches_exact_tool_names_and_can_deny_all() {
+        let allowed = HashSet::from(["search".to_string()]);
+        assert!(tool_allowed(Some(&allowed), "search"));
+        assert!(!tool_allowed(Some(&allowed), "delete"));
+        assert!(!tool_allowed(Some(&HashSet::new()), "search"));
+    }
+
+    #[test]
+    fn mcp_transport_sends_configured_token_as_bearer_auth() {
+        let config = mcp_transport_config("http://localhost/mcp".into(), Some("secret".into()))
+            .expect("valid token");
+        assert_eq!(config.auth_header.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn mcp_transport_rejects_empty_token() {
+        assert!(mcp_transport_config("http://localhost/mcp".into(), Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn filtered_sink_registers_only_allowlisted_mcp_tools() {
+        let handle = rig::tool::server::ToolServer::new().run();
+        let sink = FilteredToolSink {
+            inner: handle.clone(),
+            allowlist: Some(HashSet::from(["search".to_string()])),
+        };
+        let tool = |name: &'static str| {
+            DynamicTool::new(
+                rig::message::ToolName::new(name).expect("valid tool name"),
+                "test tool",
+                serde_json::json!({"type": "object"}),
+                |_| Box::pin(async { Ok(rig::tool::ToolOutput::text("ok")) }),
+            )
+        };
+
+        let expected = sink.add_managed_tools(vec![tool("search"), tool("delete")]);
+        sink.reconcile_managed_tools(expected, vec![tool("delete")]);
+
+        let catalog = handle.snapshot();
+        assert!(!catalog.contains("search"));
+        assert!(!catalog.contains("delete"));
+    }
 }

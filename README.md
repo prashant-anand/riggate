@@ -98,13 +98,18 @@ max_turns = 10                     # model calls per request, including tool fol
 
 [[agents.mcp_servers]]
 url = "http://127.0.0.1:9000/mcp" # Streamable HTTP MCP endpoint
+# bearer_token_env = "MCP_SEARCH_TOKEN" # optional; value is read from the environment
+# allowed_tools = ["search", "read"]  # optional; absent means all discovered tools
 ```
 
 MCP server tools are discovered when Riggate starts and refreshed when the server announces
 tool-list changes. Keep the configured agent's `max_turns` high enough for tool calls and
-follow-up model responses. MCP endpoints must be reachable from the Riggate host. This
-version supports Streamable HTTP endpoints; stdio transport and per-server auth configuration
-are not available yet.
+follow-up model responses. MCP endpoints must be reachable from the Riggate host.
+`bearer_token_env` names an environment variable whose value is sent as a bearer token; the
+token itself stays out of the config file. When `allowed_tools` is set, only those exact tool
+names are registered, including after the MCP server refreshes its tool list. Set it to `[]`
+to disable every tool from that server. This version supports Streamable HTTP endpoints; stdio
+transport is not available yet.
 
 Provider endpoints and credentials come from the environment, never the config file:
 
@@ -113,6 +118,7 @@ Provider endpoints and credentials come from the environment, never the config f
 | `OPENAI_API_KEY` | `provider = "openai"` |
 | `OPENAI_BASE_URL` | Azure OpenAI, vLLM, or an internal gateway |
 | `OLLAMA_API_BASE_URL` | `provider = "ollama"` (optional; defaults to localhost) |
+| MCP token variables | Set each `bearer_token_env` variable on the Riggate process |
 
 ## Status
 
