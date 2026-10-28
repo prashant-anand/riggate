@@ -16,33 +16,21 @@ Check it answers on its own:
 curl http://localhost:11434/api/tags | head -c 200
 ```
 
-## 2. A config with one local agent
+## 2. The config that ships with this example
 
-Save this as `smoke.toml`. It has a single Ollama agent, so no hosted credential is needed.
-
-```toml
-bind = "127.0.0.1:8080"
-
-[[agents]]
-name = "local"
-provider = "ollama"
-model = "gemma4:12b"
-preamble = "Answer in one sentence."
-max_turns = 4
-```
-
-Confirm it parses before starting anything:
+`examples/smoke-agent/riggate.toml` configures one Ollama agent named `demo`, so no hosted
+credential is needed. Confirm it parses before starting anything:
 
 ```bash
-riggate check --config smoke.toml
+riggate check --config examples/smoke-agent/riggate.toml
 # config ok — 1 agent(s)
-#   local -> gemma4:12b (Ollama), max_turns=4, mcp_servers=0
+#   demo -> gemma4:12b (Ollama), max_turns=2, mcp_servers=0
 ```
 
 ## 3. Start the server
 
 ```bash
-RIGGATE_API_KEY=smoke-test riggate serve --config smoke.toml
+RIGGATE_API_KEY=smoke-test riggate serve --config examples/smoke-agent/riggate.toml
 # INFO riggate: riggate listening bind=127.0.0.1:8080 agents=1
 ```
 
@@ -54,7 +42,7 @@ Leave it running and use a second terminal.
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer smoke-test' \
-  -d '{"model":"local","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
+  -d '{"model":"demo","messages":[{"role":"user","content":"What is the capital of France?"}]}' \
   | python3 -m json.tool
 ```
 
@@ -67,7 +55,7 @@ token counts.
 curl -sN http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer smoke-test' \
-  -d '{"model":"local","stream":true,"messages":[{"role":"user","content":"Count to five."}]}'
+  -d '{"model":"demo","stream":true,"messages":[{"role":"user","content":"Count to five."}]}'
 ```
 
 Chunks arrive as `data:` events and end with `data: [DONE]`.
@@ -81,7 +69,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer smoke-test' \
   -d '{
-    "model": "local",
+    "model": "demo",
     "messages": [
       {"role": "user", "content": "My name is Prashant."},
       {"role": "assistant", "content": "Hello Prashant."},
@@ -94,8 +82,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 | Symptom | Cause |
 |---|---|
-| `an openai agent needs OPENAI_API_KEY` at startup | the config has an `openai` agent; comment it out or export the key |
+| `an openai agent needs OPENAI_API_KEY` at startup | the config you passed has an `openai` agent; use the smoke config, or export the key |
 | `connecting MCP server ... failed` | an MCP endpoint is configured but not running; comment that block out |
 | `upstream error: ...` with `502` | Ollama is not running, or the model name is not pulled |
-| `unknown model 'local'` with `404` | the agent name in the request does not match `name` in the config |
+| `unknown model 'demo'` with `404` | the agent name in the request does not match `name` in the config |
 | `401` | `RIGGATE_API_KEY` is set but the request has no `authorization: Bearer ...` header |

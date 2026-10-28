@@ -21,7 +21,8 @@ five system frameworks and no OpenSSL.
 Install Riggate and copy the example configuration:
 
 ```bash
-cargo install --path .
+cargo install riggate                    # from crates.io
+# from a checkout instead: cargo install --path .
 cp examples/riggate.toml riggate.toml
 riggate check --config riggate.toml
 ```
