@@ -1,4 +1,5 @@
 mod agent;
+mod auth;
 mod config;
 mod routes;
 
@@ -73,8 +74,14 @@ fn check(path: &std::path::Path) -> Result<()> {
 
 async fn serve(path: &std::path::Path) -> Result<()> {
     let cfg = config::Config::load(path)?;
+    let api_key = std::env::var("RIGGATE_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty());
+    if auth::bind_requires_auth(&cfg.bind) && api_key.is_none() {
+        anyhow::bail!("RIGGATE_API_KEY is required when binding outside loopback");
+    }
     let registry = agent::build(&cfg.agents).await?;
-    let app = routes::router(registry);
+    let app = routes::router(registry, api_key);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await

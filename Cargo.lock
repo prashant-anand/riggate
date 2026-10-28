@@ -5500,6 +5500,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "toml",
  "tracing",

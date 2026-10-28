@@ -17,13 +17,16 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 
 use crate::agent::Registry;
+use crate::auth::authorize;
 
-pub fn router(agents: Registry) -> Router {
-    Router::new()
-        .route("/healthz", get(health))
+pub fn router(agents: Registry, api_key: Option<String>) -> Router {
+    let api = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .with_state(agents)
+        .route_layer(axum::middleware::from_fn_with_state(api_key, authorize));
+
+    Router::new().route("/healthz", get(health)).merge(api)
 }
 
 async fn health() -> &'static str {

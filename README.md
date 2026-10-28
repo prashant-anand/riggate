@@ -40,8 +40,12 @@ datacentre, or it doesn't run.
 cargo install --path .
 cp examples/sallyport.toml riggate.toml
 riggate check --config riggate.toml
-riggate serve --config riggate.toml
+RIGGATE_API_KEY='replace-with-a-long-random-token' riggate serve --config riggate.toml
 ```
+
+`RIGGATE_API_KEY` is required when `bind` is not a loopback address. Send it as an
+`Authorization: Bearer ...` header to `/v1/models` and `/v1/chat/completions`. The
+`/healthz` liveness endpoint remains unauthenticated. Loopback deployments may omit the key.
 
 Then, from any OpenAI-compatible client:
 
