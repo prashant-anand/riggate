@@ -6,6 +6,18 @@ fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
 
+fn default_max_request_bytes() -> usize {
+    1_048_576
+}
+
+fn default_max_concurrent_requests() -> usize {
+    64
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    120
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     /// Address to bind. Defaults to loopback — you opt in to exposure.
@@ -13,6 +25,12 @@ pub struct Config {
     pub bind: String,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -64,6 +82,15 @@ impl Config {
         let cfg: Config = toml::from_str(raw)?;
         if cfg.agents.is_empty() {
             bail!("config has no [[agents]] entries");
+        }
+        if cfg.max_request_bytes == 0 {
+            bail!("max_request_bytes must be greater than zero");
+        }
+        if cfg.max_concurrent_requests == 0 {
+            bail!("max_concurrent_requests must be greater than zero");
+        }
+        if cfg.request_timeout_seconds == 0 {
+            bail!("request_timeout_seconds must be greater than zero");
         }
         for a in &cfg.agents {
             if a.name.trim().is_empty() {
@@ -157,5 +184,24 @@ preamble = "Be brief."
             .unwrap_err()
             .to_string()
             .contains("empty url"));
+    }
+
+    #[test]
+    fn defaults_request_limits_to_safe_nonzero_values() {
+        let cfg = Config::parse("[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n")
+            .expect("defaults should parse");
+        assert_eq!(cfg.max_request_bytes, 1_048_576);
+        assert_eq!(cfg.max_concurrent_requests, 64);
+        assert_eq!(cfg.request_timeout_seconds, 120);
+    }
+
+    #[test]
+    fn rejects_zero_request_timeout() {
+        let raw =
+            "request_timeout_seconds=0\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("request_timeout_seconds"));
     }
 }

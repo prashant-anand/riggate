@@ -5502,8 +5502,10 @@ dependencies = [
  "serde_json",
  "subtle",
  "tokio",
+ "tokio-stream",
  "toml",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

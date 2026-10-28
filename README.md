@@ -77,10 +77,17 @@ Errors are honest: an unknown model is `404`, an invalid request is `400`, and a
 provider failure is `502` carrying the provider's own message (or an error event if streaming
 has already started).
 
+Request bodies default to a 1 MiB limit, agent calls time out after 120 seconds, and at most
+64 agent requests run concurrently. Oversized requests receive `413`, saturated servers receive
+`503`, and timed out calls receive `504` (or an SSE error event after streaming begins).
+
 ## Configuration
 
 ```toml
 bind = "127.0.0.1:8080"          # loopback by default; exposure is opt-in
+max_request_bytes = 1048576        # maximum incoming request body (1 MiB)
+max_concurrent_requests = 64       # concurrent agent requests
+request_timeout_seconds = 120      # upstream deadline
 
 [[agents]]
 name = "assistant"                # the value clients send as "model"

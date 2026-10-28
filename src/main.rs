@@ -81,7 +81,15 @@ async fn serve(path: &std::path::Path) -> Result<()> {
         anyhow::bail!("RIGGATE_API_KEY is required when binding outside loopback");
     }
     let registry = agent::build(&cfg.agents).await?;
-    let app = routes::router(registry, api_key);
+    let app = routes::router(
+        registry,
+        api_key,
+        routes::RequestLimits {
+            max_request_bytes: cfg.max_request_bytes,
+            max_concurrent_requests: cfg.max_concurrent_requests,
+            timeout: std::time::Duration::from_secs(cfg.request_timeout_seconds),
+        },
+    );
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
