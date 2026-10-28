@@ -6,9 +6,15 @@ provider, or Ollama.
 
 ## Measured
 
-| Build | Size |
+Both are stripped, thin-LTO builds from the release profile below.
+
+| Build | Size (MiB) |
 |---|---:|
-| `aarch64-apple-darwin`, release profile, rustc 1.99.1 | **9.9 MB** |
+| `aarch64-apple-darwin`, rustc 1.99.1 | **9.9** |
+| `x86_64-unknown-linux-musl`, rustc 1.99.1 | **12.7** |
+
+The Linux binary is `static-pie linked` and names no shared libraries. The macOS binary links
+five system frameworks and no OpenSSL.
 
 ## Quickstart
 
