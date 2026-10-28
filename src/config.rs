@@ -131,4 +131,31 @@ preamble = "Be brief."
             Config::parse("[[agents]]\nname=\"a\"\nprovider=\"gemini\"\nmodel=\"m\"\n").is_err()
         );
     }
+
+    #[test]
+    fn rejects_zero_max_turns() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"openai\"\nmodel=\"m\"\nmax_turns=0\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("max_turns"));
+    }
+
+    #[test]
+    fn rejects_blank_agent_name() {
+        let raw = "[[agents]]\nname=\"  \"\nprovider=\"openai\"\nmodel=\"m\"\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("empty name"));
+    }
+
+    #[test]
+    fn rejects_blank_mcp_url() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"openai\"\nmodel=\"m\"\n[[agents.mcp_servers]]\nurl=\" \"\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("empty url"));
+    }
 }

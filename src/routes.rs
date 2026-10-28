@@ -97,32 +97,7 @@ async fn chat(
         )
     })?;
 
-    let prompt_index = req
-        .messages
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no messages in request"))?;
-    if req.messages[prompt_index].role != "user" {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "the last message must have the user role",
-        ));
-    }
-    let prompt = req.messages[prompt_index].content.clone();
-    let history = req.messages[..prompt_index]
-        .iter()
-        .map(|message| match message.role.as_str() {
-            "system" => Ok(RigMessage::system(message.content.clone())),
-            "user" => Ok(RigMessage::user(message.content.clone())),
-            "assistant" => Ok(RigMessage::assistant(message.content.clone())),
-            role => Err(err(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    "unsupported message role '{role}'; supported roles are system, user, assistant"
-                ),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (prompt, history) = conversation(req.messages)?;
 
     if req.stream {
         let id = completion_id();
@@ -193,6 +168,37 @@ async fn chat(
     }
 }
 
+fn conversation(
+    messages: Vec<Message>,
+) -> Result<(String, Vec<RigMessage>), (StatusCode, Json<Value>)> {
+    let prompt_index = messages
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no messages in request"))?;
+    if messages[prompt_index].role != "user" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "the last message must have the user role",
+        ));
+    }
+    let prompt = messages[prompt_index].content.clone();
+    let history = messages[..prompt_index]
+        .iter()
+        .map(|message| match message.role.as_str() {
+            "system" => Ok(RigMessage::system(message.content.clone())),
+            "user" => Ok(RigMessage::user(message.content.clone())),
+            "assistant" => Ok(RigMessage::assistant(message.content.clone())),
+            role => Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "unsupported message role '{role}'; supported roles are system, user, assistant"
+                ),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((prompt, history))
+}
+
 fn completion_id() -> String {
     format!(
         "chatcmpl-{:x}",
@@ -208,4 +214,52 @@ fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
         code,
         Json(json!({"error": {"message": msg, "type": "riggate_error"}})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn conversation_uses_last_user_message_as_prompt_and_preserves_history() {
+        let (prompt, history) = conversation(vec![
+            message("system", "Be concise"),
+            message("user", "Earlier question"),
+            message("assistant", "Earlier answer"),
+            message("user", "Current question"),
+        ])
+        .expect("valid conversation");
+
+        assert_eq!(prompt, "Current question");
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn conversation_rejects_empty_messages() {
+        let (status, _) = conversation(vec![]).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn conversation_requires_last_message_to_be_user() {
+        let (status, _) = conversation(vec![message("assistant", "not a prompt")]).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn conversation_rejects_unsupported_history_role() {
+        let (status, _) = conversation(vec![
+            message("tool", "unsupported"),
+            message("user", "question"),
+        ])
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

@@ -38,7 +38,7 @@ datacentre, or it doesn't run.
 
 ```bash
 cargo install --path .
-cp examples/riggate.toml riggate.toml
+cp examples/sallyport.toml riggate.toml
 riggate check --config riggate.toml
 riggate serve --config riggate.toml
 ```
