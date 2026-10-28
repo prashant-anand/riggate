@@ -1,0 +1,17 @@
+# Minimal local configuration for the smoke-agent example.
+
+# Socket address to listen on. Default: 127.0.0.1:8080 (loopback).
+# A non-loopback address, such as 0.0.0.0:8080, requires RIGGATE_API_KEY.
+bind = "127.0.0.1:8080"
+
+[[agents]]
+# Name clients send in the `model` field. Must not be blank.
+name = "demo"
+# Provider: "openai" or "ollama".
+provider = "ollama"
+# Model identifier available on the configured Ollama server.
+model = "gemma4:12b"
+# Optional system instructions prepended to each conversation.
+preamble = "You are a concise assistant used to check a Riggate installation."
+# Maximum model calls per request, including tool follow-ups. Must be greater than zero. Default: 10.
+max_turns = 2
