@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         }
         _ => {
             print!("{USAGE}");
-            Ok(())
+            std::process::exit(2)
         }
     }
 }
@@ -88,6 +88,7 @@ async fn serve(path: &std::path::Path) -> Result<()> {
             max_request_bytes: cfg.max_request_bytes,
             max_concurrent_requests: cfg.max_concurrent_requests,
             timeout: std::time::Duration::from_secs(cfg.request_timeout_seconds),
+            strict_requests: cfg.strict_requests,
         },
     );
 
@@ -96,9 +97,12 @@ async fn serve(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("binding {}", cfg.bind))?;
     info!(bind = %cfg.bind, agents = cfg.agents.len(), "riggate listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 
 pub async fn authorize(
@@ -24,6 +25,12 @@ pub async fn authorize(
     if authorized {
         next.run(request).await
     } else {
+        let client = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|connect| connect.0.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::warn!(client_address = %client, "unauthorized API request");
         (
             StatusCode::UNAUTHORIZED,
             [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],

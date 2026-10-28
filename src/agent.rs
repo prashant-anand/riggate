@@ -53,12 +53,16 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
         if !cfg.mcp_servers.is_empty() {
             let tool_server = rig::tool::server::ToolServer::new().run();
             for server in &cfg.mcp_servers {
-                mcp_services.push(connect_mcp(server, &tool_server).await.with_context(|| {
-                    format!(
-                        "connecting MCP server {} for agent '{}'",
-                        server.url, cfg.name
-                    )
-                })?);
+                mcp_services.push(
+                    connect_mcp(server, &tool_server, &cfg.name)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "connecting MCP server {} for agent '{}'",
+                                server.url, cfg.name
+                            )
+                        })?,
+                );
             }
             builder = builder.tool_server_handle(tool_server);
         }
@@ -97,6 +101,7 @@ fn build_agent(builder: AgentBuilder, cfg: &AgentConfig) -> Agent {
 async fn connect_mcp(
     server: &McpServerConfig,
     tool_server: &rig::tool::server::ToolServerHandle,
+    agent: &str,
 ) -> Result<Box<dyn Send>> {
     use rig::tool::rmcp::{
         rmcp::{
@@ -117,6 +122,7 @@ async fn connect_mcp(
     let sink = FilteredToolSink {
         inner: tool_server.clone(),
         allowlist,
+        agent: agent.to_string(),
     };
     let handler = McpClientHandler::new(client_info, sink);
     let token = server
@@ -136,14 +142,46 @@ async fn connect_mcp(
 struct FilteredToolSink {
     inner: ToolServerHandle,
     allowlist: Option<HashSet<String>>,
+    agent: String,
 }
 
 impl FilteredToolSink {
     fn filter(&self, tools: Vec<DynamicTool>) -> Vec<DynamicTool> {
         tools
             .into_iter()
-            .filter(|tool| tool_allowed(self.allowlist.as_ref(), &tool.name().to_string()))
+            .filter_map(|tool| {
+                let name = tool.name();
+                let allowed = tool_allowed(self.allowlist.as_ref(), name.as_ref());
+                tracing::info!(agent = %self.agent, tool = %name, allowed, "MCP tool policy evaluated");
+                allowed.then(|| self.instrument_tool(tool))
+            })
             .collect()
+    }
+
+    fn instrument_tool(&self, tool: DynamicTool) -> DynamicTool {
+        let definition = tool.definition();
+        let tool_name = definition.name.to_string();
+        let agent = self.agent.clone();
+        let source = tool.clone();
+        let live_source = tool;
+        DynamicTool::new(
+            definition.name,
+            definition.description,
+            definition.parameters,
+            move |arguments| {
+                let source = source.clone();
+                let agent = agent.clone();
+                let tool_name = tool_name.clone();
+                Box::pin(async move {
+                    tracing::info!(agent = %agent, tool = %tool_name, allowed = true, "MCP tool invocation started");
+                    let result = source.run(arguments).await;
+                    tracing::info!(agent = %agent, tool = %tool_name, succeeded = result.is_ok(), "MCP tool invocation finished");
+                    result
+                })
+            },
+        )
+        .with_annotations(definition.annotations)
+        .with_liveness(move || live_source.is_live())
     }
 }
 
@@ -226,6 +264,7 @@ mod tests {
         let sink = FilteredToolSink {
             inner: handle.clone(),
             allowlist: Some(HashSet::from(["search".to_string()])),
+            agent: "test".to_string(),
         };
         let tool = |name: &'static str| {
             DynamicTool::new(
@@ -237,6 +276,7 @@ mod tests {
         };
 
         let expected = sink.add_managed_tools(vec![tool("search"), tool("delete")]);
+        assert!(handle.snapshot().contains("search"));
         sink.reconcile_managed_tools(expected, vec![tool("delete")]);
 
         let catalog = handle.snapshot();

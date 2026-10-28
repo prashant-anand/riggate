@@ -1,6 +1,6 @@
 use axum::{
     extract::{rejection::JsonRejection, Extension, Json, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::sse::{Event, Sse},
     response::IntoResponse,
     routing::{get, post},
@@ -9,7 +9,7 @@ use axum::{
 use futures_util::{stream, StreamExt};
 use rig::{
     agent::MultiTurnStreamItem,
-    completion::Message as RigMessage,
+    completion::{FinishReason, Message as RigMessage},
     streaming::{Item, StreamEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use std::{collections::HashMap, convert::Infallible};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tower_http::limit::RequestBodyLimitLayer;
+use tracing::Instrument;
 
 use crate::agent::Registry;
 use crate::auth::authorize;
@@ -27,6 +28,7 @@ pub struct RequestLimits {
     pub max_request_bytes: usize,
     pub max_concurrent_requests: usize,
     pub timeout: Duration,
+    pub strict_requests: bool,
 }
 
 impl Default for RequestLimits {
@@ -35,6 +37,7 @@ impl Default for RequestLimits {
             max_request_bytes: 1_048_576,
             max_concurrent_requests: 64,
             timeout: Duration::from_secs(120),
+            strict_requests: false,
         }
     }
 }
@@ -43,17 +46,45 @@ impl Default for RequestLimits {
 struct RequestControl {
     semaphore: Arc<Semaphore>,
     timeout: Duration,
+    strict_requests: bool,
+}
+
+#[derive(Clone)]
+struct AppState {
+    agents: Registry,
+    started_at: u64,
+}
+
+struct RequestCompletionGuard {
+    span: tracing::Span,
+    started: tokio::time::Instant,
+}
+
+impl Drop for RequestCompletionGuard {
+    fn drop(&mut self) {
+        self.span.record("status", StatusCode::OK.as_u16());
+        self.span
+            .record("duration_ms", self.started.elapsed().as_millis() as u64);
+        tracing::info!(parent: &self.span, "chat request completed");
+    }
 }
 
 pub fn router(agents: Registry, api_key: Option<String>, limits: RequestLimits) -> Router {
     let control = RequestControl {
         semaphore: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
         timeout: limits.timeout,
+        strict_requests: limits.strict_requests,
     };
     let api = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
-        .with_state(agents)
+        .with_state(AppState {
+            agents,
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+        })
         .layer(Extension(control))
         .layer(RequestBodyLimitLayer::new(limits.max_request_bytes))
         .route_layer(axum::middleware::from_fn_with_state(api_key, authorize));
@@ -67,10 +98,11 @@ async fn health() -> &'static str {
 
 /// Advertises configured agents in the OpenAI `/v1/models` shape, so existing
 /// OpenAI SDKs can discover them without custom code.
-async fn models(State(agents): State<Registry>) -> Json<Value> {
-    let data: Vec<Value> = agents
+async fn models(State(state): State<AppState>) -> Json<Value> {
+    let data: Vec<Value> = state
+        .agents
         .keys()
-        .map(|name| json!({"id": name, "object": "model", "owned_by": "riggate"}))
+        .map(|name| json!({"id": name, "object": "model", "created": state.started_at, "owned_by": "riggate"}))
         .collect();
     Json(json!({"object": "list", "data": data}))
 }
@@ -113,7 +145,51 @@ impl StopSequences {
 struct Message {
     role: String,
     #[serde(default)]
-    content: String,
+    content: MessageContent,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    #[default]
+    Empty,
+    Text(String),
+    Parts(Vec<TextPart>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TextPart {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+impl MessageContent {
+    fn into_text(self) -> Result<String, (StatusCode, Json<Value>)> {
+        match self {
+            Self::Empty => Ok(String::new()),
+            Self::Text(text) => Ok(text),
+            Self::Parts(parts) => parts
+                .into_iter()
+                .map(|part| {
+                    if part.kind == "text" {
+                        part.text.ok_or_else(|| {
+                            err(
+                                StatusCode::BAD_REQUEST,
+                                "text content parts must include a text field",
+                            )
+                        })
+                    } else {
+                        Err(err(
+                            StatusCode::BAD_REQUEST,
+                            "only text content parts are supported",
+                        ))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|parts| parts.concat()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -147,9 +223,39 @@ struct ChatResponse {
 }
 
 async fn chat(
-    State(agents): State<Registry>,
+    State(state): State<AppState>,
     Extension(control): Extension<RequestControl>,
     request: Result<Json<ChatRequest>, JsonRejection>,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let request_id = completion_id();
+    let span = tracing::info_span!("chat.request", request_id = %request_id, agent = tracing::field::Empty, status = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
+    let started = tokio::time::Instant::now();
+    let result = chat_inner(State(state), Extension(control), request, started)
+        .instrument(span.clone())
+        .await;
+    let status = result
+        .as_ref()
+        .map(|response| response.status())
+        .unwrap_or_else(|(status, _)| *status);
+    let is_stream = result
+        .as_ref()
+        .ok()
+        .and_then(|response| response.headers().get(header::CONTENT_TYPE))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if !is_stream {
+        span.record("status", status.as_u16());
+        span.record("duration_ms", started.elapsed().as_millis() as u64);
+        tracing::info!(parent: &span, "chat request completed");
+    }
+    result
+}
+
+async fn chat_inner(
+    State(state): State<AppState>,
+    Extension(control): Extension<RequestControl>,
+    request: Result<Json<ChatRequest>, JsonRejection>,
+    started: tokio::time::Instant,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let Json(req) = request.map_err(|rejection| {
         let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -162,8 +268,9 @@ async fn chat(
             &format!("invalid request body: {}", rejection.body_text()),
         )
     })?;
-    validate_chat_request(&req)?;
-    let agent = agents.get(&req.model).ok_or_else(|| {
+    tracing::Span::current().record("agent", req.model.as_str());
+    validate_chat_request(&req, control.strict_requests)?;
+    let agent = state.agents.get(&req.model).ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
             &format!("unknown model '{}'; call GET /v1/models", req.model),
@@ -171,12 +278,17 @@ async fn chat(
     })?;
 
     let (prompt, history) = conversation(req.messages)?;
-    let permit = control.semaphore.clone().try_acquire_owned().map_err(|_| {
-        err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server is at its concurrent request limit; retry later",
-        )
-    })?;
+    let permit = match control.semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({"error": {"message": "server is at its concurrent request limit; retry later", "type": "riggate_error"}})),
+            )
+                .into_response())
+        }
+    };
     let mut runner = agent.prompt(prompt).history(history);
     if let Some(temperature) = req.temperature {
         runner = runner.temperature(temperature);
@@ -204,21 +316,34 @@ async fn chat(
     if req.stream {
         let id = completion_id();
         let model = req.model.clone();
+        let max_tokens = req.max_tokens.or(req.max_completion_tokens);
         let run = runner.stream();
         let timeout = control.timeout;
+        let span = tracing::Span::current();
+        let completion_guard = RequestCompletionGuard {
+            span: span.clone(),
+            started,
+        };
+        // A per-item timeout alone lets a slow drip hold the permit forever, so
+        // the same Instant bounds the whole stream as well.
+        let deadline = tokio::time::Instant::now() + timeout;
         let events = tokio_stream::StreamExt::timeout(run, timeout)
+            .map(move |item| match item {
+                Ok(_) if tokio::time::Instant::now() >= deadline => Err(()),
+                Ok(inner) => Ok(inner),
+                Err(_) => Err(()),
+            })
             .scan(false, |timed_out, item| {
-                let is_timeout = item.is_err();
                 if *timed_out {
-                    futures_util::future::ready(None)
-                } else {
-                    *timed_out = is_timeout;
-                    futures_util::future::ready(Some(item))
+                    return futures_util::future::ready(None);
                 }
+                *timed_out = item.is_err();
+                futures_util::future::ready(Some(item))
             })
             .filter_map(move |item| {
                 let id = id.clone();
                 let model = model.clone();
+                let span = span.clone();
                 async move {
                     let chunk = match item {
                         Err(_) => json!({
@@ -235,12 +360,23 @@ async fn chat(
                             "model": model,
                             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
                         }),
-                        Ok(Ok(MultiTurnStreamItem::FinalResponse(_))) => json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                        }),
+                        Ok(Ok(MultiTurnStreamItem::FinalResponse(res))) => {
+                            span.record("prompt_tokens", res.usage.input_tokens);
+                            span.record("completion_tokens", res.usage.output_tokens);
+                            let finish_reason = completion_finish_reason(
+                                res.completion_calls
+                                    .last()
+                                    .and_then(|call| call.finish_reason.clone()),
+                                res.usage.output_tokens,
+                                max_tokens,
+                            );
+                            json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                            })
+                        }
                         Ok(Err(error)) => json!({
                             "error": {
                                 "message": format!("upstream error: {error}"),
@@ -256,33 +392,46 @@ async fn chat(
                 Event::default().data("[DONE]"),
             )]))
             .boxed();
-        let events = stream::unfold((events, permit), |(mut events, permit)| async move {
-            let next = events.next().await?;
-            Some((next, (events, permit)))
-        });
+        let events = stream::unfold(
+            (events, permit, completion_guard),
+            |(mut events, permit, completion_guard)| async move {
+                let next = events.next().await?;
+                Some((next, (events, permit, completion_guard)))
+            },
+        );
         return Ok(Sse::new(events).into_response());
     }
 
     match tokio::time::timeout(control.timeout, runner).await {
-        Ok(Ok(res)) => Ok(Json(json!(ChatResponse {
-            id: completion_id(),
-            object: "chat.completion",
-            model: req.model.clone(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: OutMessage {
-                    role: "assistant",
-                    content: res.output().to_string(),
+        Ok(Ok(res)) => {
+            tracing::Span::current().record("prompt_tokens", res.usage.input_tokens);
+            tracing::Span::current().record("completion_tokens", res.usage.output_tokens);
+            Ok(Json(json!(ChatResponse {
+                id: completion_id(),
+                object: "chat.completion",
+                model: req.model.clone(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: OutMessage {
+                        role: "assistant",
+                        content: res.output().to_string(),
+                    },
+                    finish_reason: completion_finish_reason(
+                        res.completion_calls
+                            .last()
+                            .and_then(|call| call.finish_reason.clone()),
+                        res.usage.output_tokens,
+                        req.max_tokens.or(req.max_completion_tokens),
+                    ),
+                }],
+                usage: UsageOut {
+                    prompt_tokens: res.usage.input_tokens,
+                    completion_tokens: res.usage.output_tokens,
+                    total_tokens: res.usage.total_tokens,
                 },
-                finish_reason: "stop",
-            }],
-            usage: UsageOut {
-                prompt_tokens: res.usage.input_tokens,
-                completion_tokens: res.usage.output_tokens,
-                total_tokens: res.usage.total_tokens,
-            },
-        }))
-        .into_response()),
+            }))
+            .into_response())
+        }
         Ok(Err(e)) => Err(err(
             StatusCode::BAD_GATEWAY,
             &format!("upstream error: {e}"),
@@ -294,8 +443,11 @@ async fn chat(
     }
 }
 
-fn validate_chat_request(req: &ChatRequest) -> Result<(), (StatusCode, Json<Value>)> {
-    if !req.unsupported_fields.is_empty() {
+fn validate_chat_request(
+    req: &ChatRequest,
+    strict_requests: bool,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if strict_requests && !req.unsupported_fields.is_empty() {
         let mut names: Vec<_> = req.unsupported_fields.keys().cloned().collect();
         names.sort();
         return Err(err(
@@ -344,6 +496,20 @@ fn validate_chat_request(req: &ChatRequest) -> Result<(), (StatusCode, Json<Valu
     Ok(())
 }
 
+fn completion_finish_reason(
+    reported: Option<FinishReason>,
+    output_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+) -> &'static str {
+    if matches!(reported, Some(FinishReason::Length))
+        || max_tokens.is_some_and(|limit| output_tokens.is_some_and(|used| used >= limit))
+    {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
 fn conversation(
     messages: Vec<Message>,
 ) -> Result<(String, Vec<RigMessage>), (StatusCode, Json<Value>)> {
@@ -357,13 +523,13 @@ fn conversation(
             "the last message must have the user role",
         ));
     }
-    let prompt = messages[prompt_index].content.clone();
+    let prompt = messages[prompt_index].content.clone().into_text()?;
     let history = messages[..prompt_index]
         .iter()
         .map(|message| match message.role.as_str() {
-            "system" => Ok(RigMessage::system(message.content.clone())),
-            "user" => Ok(RigMessage::user(message.content.clone())),
-            "assistant" => Ok(RigMessage::assistant(message.content.clone())),
+            "system" => Ok(RigMessage::system(message.content.clone().into_text()?)),
+            "user" => Ok(RigMessage::user(message.content.clone().into_text()?)),
+            "assistant" => Ok(RigMessage::assistant(message.content.clone().into_text()?)),
             role => Err(err(
                 StatusCode::BAD_REQUEST,
                 &format!(
@@ -401,7 +567,7 @@ mod tests {
     fn message(role: &str, content: &str) -> Message {
         Message {
             role: role.into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
         }
     }
 
@@ -449,8 +615,52 @@ mod tests {
             "n": 2
         }))
         .expect("request decodes so the field can be reported");
-        let (status, _) = validate_chat_request(&request).unwrap_err();
+        let (status, _) = validate_chat_request(&request, true).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn chat_request_ignores_unknown_fields_by_default_but_can_be_strict() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        assert!(validate_chat_request(&request, false).is_ok());
+        assert_eq!(
+            validate_chat_request(&request, true).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn conversation_accepts_text_content_parts() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}]}
+            ]
+        }))
+        .unwrap();
+        let (prompt, history) = conversation(request.messages).unwrap();
+        assert_eq!(prompt, "hello world");
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn conversation_rejects_non_text_content_parts_with_a_clear_error() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}]
+        }))
+        .unwrap();
+        let error = conversation(request.messages).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1 .0["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("only text content parts"));
     }
 
     #[test]
@@ -463,7 +673,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            validate_chat_request(&conflicting).unwrap_err().0,
+            validate_chat_request(&conflicting, false).unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
 
@@ -474,8 +684,23 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            validate_chat_request(&invalid_temperature).unwrap_err().0,
+            validate_chat_request(&invalid_temperature, false)
+                .unwrap_err()
+                .0,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn finish_reason_reports_length_when_provider_or_token_limit_indicates_truncation() {
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::Length), Some(5), None),
+            "length"
+        );
+        assert_eq!(completion_finish_reason(None, Some(5), Some(5)), "length");
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::Stop), Some(4), Some(5)),
+            "stop"
         );
     }
 
@@ -557,7 +782,7 @@ mod tests {
                     "message": {"role": "assistant", "content": "mock answer"},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                "usage": {"prompt_tokens": 4, "completion_tokens": 42, "total_tokens": 46}
                 }))
             }
         });
@@ -592,6 +817,7 @@ mod tests {
             completion["choices"][0]["message"]["content"],
             "mock answer"
         );
+        assert_eq!(completion["choices"][0]["finish_reason"], "length");
         assert_eq!(completion["model"], "mock");
         let upstream = received_request.lock().unwrap().clone().unwrap();
         assert_eq!(upstream["temperature"], 0.3);
@@ -670,6 +896,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_completion_has_an_absolute_deadline_for_slow_drip_chunks() {
+        let provider = Router::new()
+            .route("/v1/chat/completions", post(slow_stream_response))
+            .route("/chat/completions", post(slow_stream_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let registry = crate::agent::test_registry(&format!("http://{address}/v1"));
+        let app = router(
+            registry,
+            None,
+            RequestLimits {
+                timeout: Duration::from_secs(1),
+                ..RequestLimits::default()
+            },
+        );
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"mock","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let elapsed = started.elapsed();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "elapsed: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+        assert!(body.contains("upstream request timed out"), "{body}");
+        assert!(body.contains("[DONE]"), "{body}");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn rejects_agent_calls_above_the_concurrency_limit() {
         let request_started = Arc::new(tokio::sync::Notify::new());
         let started = request_started.clone();
@@ -708,6 +983,7 @@ mod tests {
         request_started.notified().await;
         let second = app.oneshot(chat_request()).await.unwrap();
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second.headers()[header::RETRY_AFTER], "1");
         assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
         server.abort();
     }
@@ -718,6 +994,23 @@ mod tests {
             .body(Body::from(
                 r#"{"model":"mock","messages":[{"role":"user","content":"hello"}]}"#,
             ))
+            .unwrap()
+    }
+
+    async fn slow_stream_response() -> axum::response::Response {
+        let chunk_stream = stream::unfold(0usize, |index| async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let chunk = "data: {\"id\":\"slow-drip\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n";
+            Some((
+                Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from_static(
+                    chunk.as_bytes(),
+                )),
+                index + 1,
+            ))
+        });
+        axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(chunk_stream))
             .unwrap()
     }
 }

@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "A single-binary agent server for air-gapped networks. Bring your own model."
 license = "MIT"
-repository = "https://github.com/samisen-io/sallyport"
+repository = "https://github.com/prashant-anand/riggate"
 keywords = ["llm", "agents", "mcp", "air-gapped", "on-prem"]
 categories = ["command-line-utilities", "web-programming::http-server"]
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
 
 [dependencies]
 anyhow = "1"

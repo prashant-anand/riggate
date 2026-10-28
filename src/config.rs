@@ -31,6 +31,8 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    #[serde(default)]
+    pub strict_requests: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -219,6 +221,7 @@ preamble = "Be brief."
         assert_eq!(cfg.max_request_bytes, 1_048_576);
         assert_eq!(cfg.max_concurrent_requests, 64);
         assert_eq!(cfg.request_timeout_seconds, 120);
+        assert!(!cfg.strict_requests);
     }
 
     #[test]

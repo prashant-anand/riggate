@@ -1,145 +1,142 @@
 # riggate
 
-**A single-binary agent server for air-gapped networks.** Bring your own model.
-
-Riggate combines Rig, the Rust agent framework, with the idea of a controlled gateway:
-a small, auditable door through which a network lets an AI agent work.
-
-```
-$ riggate serve
-2026-10-28T11:22:04Z  INFO riggate: riggate listening bind=127.0.0.1:8080 agents=1
-```
-
-## Why
-
-Most agent infrastructure assumes the cloud. For a bank, a hospital, or a captive centre,
-that assumption ends the project at the security review: the agent runs in someone else's
-datacentre, or it doesn't run.
-
-`riggate` takes the opposite position.
-
-- **One file.** No interpreter, no container runtime, no package manager. Copy it, run it.
-- **Your network.** Binds to loopback by default. Egress goes only where you point it.
-- **Your model.** OpenAI, Azure OpenAI, any OpenAI-compatible endpoint, or Ollama inside
-  the building. With a local model it runs with the WAN unplugged.
-- **An API your tools already speak.** OpenAI's `/v1/chat/completions` shape, so existing
-  SDKs and clients work without a custom integration.
+Riggate runs [Rig](https://rig.rs) agents behind an OpenAI-compatible HTTP API. It is a
+single Rust binary that you can run inside your own network with OpenAI, an OpenAI-compatible
+provider, or Ollama.
 
 ## Measured
 
-| | |
-|---|---|
-| Release binary | **13 MB**, self-contained |
-| Runtime dependencies | none — no Python, no JVM, no containers |
-| OS libraries linked (macOS) | 5 system frameworks, no OpenSSL (rustls) |
-| Answers from a local model | verified with `ollama` + `gemma4:12b`, no network egress |
+| Build | Size |
+|---|---:|
+| `aarch64-apple-darwin`, release profile, rustc 1.99.1 | **9.9 MB** |
 
 ## Quickstart
 
+Install Riggate and copy the example configuration:
+
 ```bash
 cargo install --path .
-cp examples/sallyport.toml riggate.toml
+cp examples/riggate.toml riggate.toml
 riggate check --config riggate.toml
-RIGGATE_API_KEY='replace-with-a-long-random-token' riggate serve --config riggate.toml
 ```
 
-`RIGGATE_API_KEY` is required when `bind` is not a loopback address. Send it as an
-`Authorization: Bearer ...` header to `/v1/models` and `/v1/chat/completions`. The
-`/healthz` liveness endpoint remains unauthenticated. Loopback deployments may omit the key.
-
-Then, from any OpenAI-compatible client:
+The example config includes an OpenAI agent and an Ollama agent, so set credentials for the
+providers you configure. The OpenAI agent needs `OPENAI_API_KEY`. Ollama defaults to
+`http://localhost:11434`; set `OLLAMA_API_BASE_URL` if your Ollama server runs elsewhere. Make
+sure Ollama is running and has the configured model available before sending requests to it.
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/chat/completions \
+export OPENAI_API_KEY="your-provider-key"
+export RIGGATE_API_KEY="$(openssl rand -hex 32)"
+riggate serve --config riggate.toml
+```
+
+The server listens on `127.0.0.1:8080`. The API key is optional on loopback, but when set it
+protects `/v1/models` and `/v1/chat/completions`. Any non-loopback bind requires
+`RIGGATE_API_KEY`.
+
+Send a chat completion request:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer ${RIGGATE_API_KEY}" \
   -d '{"model":"local","messages":[{"role":"user","content":"What is the capital of France?"}]}'
 ```
 
-```json
-{"id":"chatcmpl-18e2ad9c34277be8","object":"chat.completion","model":"local",
- "choices":[{"index":0,"message":{"role":"assistant","content":"Paris."},"finish_reason":"stop"}],
- "usage":{"prompt_tokens":32,"completion_tokens":196,"total_tokens":228}}
-```
+The `model` value is the configured agent name. Riggate returns an OpenAI-shaped chat
+completion response.
 
-## Endpoints
+To test a local agent end to end, see the [smoke-agent example](examples/smoke-agent/README.md).
 
-| Method | Path | Purpose |
+## What it supports
+
+- OpenAI Chat Completions requests at `/v1/chat/completions`, including server-sent event
+  streaming.
+- Configured OpenAI, OpenAI-compatible, and Ollama providers. Provider credentials and base
+  URLs come from environment variables.
+- Streamable HTTP MCP servers, with optional bearer credentials and per-server tool allowlists.
+- Request body limits, an upstream timeout, and a configurable limit on concurrent agent runs.
+- Stateless conversations: clients send the conversation history with each request.
+
+Supported generation options are `temperature`, `top_p`, `max_tokens`,
+`max_completion_tokens`, `stop`, `frequency_penalty`, and `presence_penalty`. The two token
+limit fields cannot be used together. Unknown request fields are accepted and ignored by
+default; set `strict_requests = true` to reject them. Invalid option values return a clear
+`400` error.
+
+## HTTP API
+
+| Method | Path | Description |
 |---|---|---|
-| `GET` | `/healthz` | liveness probe |
-| `GET` | `/v1/models` | configured agents, OpenAI shape |
-| `POST` | `/v1/chat/completions` | run one agent |
+| `GET` | `/healthz` | Liveness check; does not require authentication |
+| `GET` | `/v1/models` | Lists configured agents |
+| `POST` | `/v1/chat/completions` | Runs an agent |
 
-The API accepts system, user, and assistant text messages. Earlier messages are sent as
-conversation history, and the latest user message starts the agent run. With `stream: true`,
-responses are streamed as OpenAI-compatible server-sent events.
+Requests accept text messages with `system`, `user`, or `assistant` roles. The final message
+must be from the user. Message content may be a string or an array of text parts; image and
+other non-text parts are not supported. Errors use HTTP status codes: unknown models return
+`404`, invalid requests return `400`, oversized bodies return `413`, upstream failures return `502`, and
+requests rejected at the concurrency limit return `503`. Upstream timeouts return `504`; if a
+stream has started, errors are sent in an SSE event.
 
-Chat requests support `temperature` (0–2), `top_p` (0–1), `max_tokens` or
-`max_completion_tokens`, `stop`, `frequency_penalty`, and `presence_penalty`. The two token limit
-fields cannot be sent together. Unknown fields and invalid option values return a `400` with an
-error message instead of being silently ignored.
-
-Errors are honest: an unknown model is `404`, an invalid request is `400`, and an upstream
-provider failure is `502` carrying the provider's own message (or an error event if streaming
-has already started).
-
-Request bodies default to a 1 MiB limit, agent calls time out after 120 seconds, and at most
-64 agent requests run concurrently. Oversized requests receive `413`, saturated servers receive
-`503`, and timed out calls receive `504` (or an SSE error event after streaming begins).
+Riggate serves plaintext HTTP and does not terminate TLS. For remote access, put it behind a
+TLS-enabled ingress or reverse proxy; do not expose the plaintext listener directly to an
+untrusted network.
 
 ## Configuration
 
 ```toml
-bind = "127.0.0.1:8080"          # loopback by default; exposure is opt-in
-max_request_bytes = 1048576        # maximum incoming request body (1 MiB)
-max_concurrent_requests = 64       # concurrent agent requests
-request_timeout_seconds = 120      # upstream deadline
+bind = "127.0.0.1:8080"
+max_request_bytes = 1048576
+max_concurrent_requests = 64
+request_timeout_seconds = 120
+strict_requests = false
 
 [[agents]]
-name = "assistant"                # the value clients send as "model"
-provider = "openai"               # openai | ollama
+name = "assistant"                # clients use this as the model name
+provider = "openai"               # openai or ollama
 model = "gpt-5.5"
 preamble = "You are a helpful assistant."
 max_turns = 10                     # model calls per request, including tool follow-ups
 
 [[agents.mcp_servers]]
-url = "http://127.0.0.1:9000/mcp" # Streamable HTTP MCP endpoint
-# bearer_token_env = "MCP_SEARCH_TOKEN" # optional; value is read from the environment
-# allowed_tools = ["search", "read"]  # optional; absent means all discovered tools
+url = "http://127.0.0.1:9000/mcp"
+# bearer_token_env = "MCP_SEARCH_TOKEN"
+# allowed_tools = ["search", "read"]
 ```
 
-MCP server tools are discovered when Riggate starts and refreshed when the server announces
-tool-list changes. Keep the configured agent's `max_turns` high enough for tool calls and
-follow-up model responses. MCP endpoints must be reachable from the Riggate host.
-`bearer_token_env` names an environment variable whose value is sent as a bearer token; the
-token itself stays out of the config file. When `allowed_tools` is set, only those exact tool
-names are registered, including after the MCP server refreshes its tool list. Set it to `[]`
-to disable every tool from that server. This version supports Streamable HTTP endpoints; stdio
-transport is not available yet.
+The top-level request controls default to a 1 MiB body limit, 64 concurrent agent runs, and a
+120-second upstream timeout. Unknown request fields are ignored by default; set
+`strict_requests = true` to restore rejection of unknown fields. Set `allowed_tools` to restrict
+which tools an MCP server can provide. If omitted, all tools are available; an empty list
+disables all tools from that server. The allowlist also applies when the server refreshes its
+tool list.
 
-Provider endpoints and credentials come from the environment, never the config file:
+Set `bearer_token_env` to the name of an environment variable containing the MCP server's
+bearer token. Riggate reads the value when it starts and does not store credentials in the TOML
+file.
 
-| Variable | Used by |
+| Environment variable | Purpose |
 |---|---|
-| `OPENAI_API_KEY` | `provider = "openai"` |
-| `OPENAI_BASE_URL` | Azure OpenAI, vLLM, or an internal gateway |
-| `OLLAMA_API_BASE_URL` | `provider = "ollama"` (optional; defaults to localhost) |
-| MCP token variables | Set each `bearer_token_env` variable on the Riggate process |
+| `RIGGATE_API_KEY` | Protect API routes and allow non-loopback binds |
+| `OPENAI_API_KEY` | OpenAI provider credential |
+| `OPENAI_BASE_URL` | OpenAI-compatible endpoint, such as Azure OpenAI or vLLM |
+| `OLLAMA_API_BASE_URL` | Ollama endpoint; defaults to `http://localhost:11434` |
+| MCP token variable | The variable named by an MCP server's `bearer_token_env` |
 
-## Status
+MCP endpoints must be reachable from the Riggate host. Riggate currently supports Streamable
+HTTP transport; stdio transport is not implemented.
 
-`v0.1` — conversational agents over an OpenAI-compatible HTTP surface. Deliberately small.
+## Built with Rig
 
-Not yet implemented, in order of intent:
+Rig supplies the agent runtime and provider clients. Riggate adds configuration, an
+OpenAI-compatible HTTP interface, MCP connections, and request controls around it. See
+[`docs/DESIGN.md`](docs/DESIGN.md) for the design decisions.
 
-1. **Retrieval** — RAG over a vector store you host
+## Roadmap
 
-This is not a hosted platform, an orchestrator, or a multi-agent framework. It is one
-binary that runs one or more configured agents behind a boring HTTP API.
-
-## Built on
-
-[Rig](https://rig.rs) — a Rust agent framework with one API over 20+ providers — plus
-`axum` and `tokio`. See [`docs/DESIGN.md`](docs/DESIGN.md) for why the shape is what it is.
+- Retrieval over a vector store you host.
 
 ## Licence
 
