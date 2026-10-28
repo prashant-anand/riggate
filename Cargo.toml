@@ -1,6 +1,6 @@
 [package]
 name = "riggate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A single-binary agent server for air-gapped networks. Bring your own model."
 license = "MIT"
