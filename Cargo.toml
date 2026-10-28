@@ -1,0 +1,20 @@
+[package]
+name = "sallyport"
+version = "0.1.0"
+edition = "2021"
+description = "A single-binary agent server for air-gapped networks. Bring your own model."
+license = "MIT"
+repository = "https://github.com/samisen-io/sallyport"
+keywords = ["llm", "agents", "mcp", "air-gapped", "on-prem"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+rig = "0.45"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
