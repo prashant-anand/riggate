@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Extension, Json, State},
+    extract::{rejection::JsonRejection, Extension, Json, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     response::IntoResponse,
@@ -14,7 +14,7 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -82,6 +82,31 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(default)]
     stream: bool,
+    temperature: Option<f64>,
+    max_tokens: Option<u64>,
+    max_completion_tokens: Option<u64>,
+    top_p: Option<f64>,
+    stop: Option<StopSequences>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    #[serde(flatten)]
+    unsupported_fields: HashMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StopSequences {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSequences {
+    fn as_value(&self) -> Value {
+        match self {
+            Self::One(value) => json!(value),
+            Self::Many(values) => json!(values),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,8 +149,20 @@ struct ChatResponse {
 async fn chat(
     State(agents): State<Registry>,
     Extension(control): Extension<RequestControl>,
-    Json(req): Json<ChatRequest>,
+    request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let Json(req) = request.map_err(|rejection| {
+        let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        err(
+            status,
+            &format!("invalid request body: {}", rejection.body_text()),
+        )
+    })?;
+    validate_chat_request(&req)?;
     let agent = agents.get(&req.model).ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
@@ -140,11 +177,34 @@ async fn chat(
             "server is at its concurrent request limit; retry later",
         )
     })?;
+    let mut runner = agent.prompt(prompt).history(history);
+    if let Some(temperature) = req.temperature {
+        runner = runner.temperature(temperature);
+    }
+    if let Some(max_tokens) = req.max_tokens.or(req.max_completion_tokens) {
+        runner = runner.max_tokens(max_tokens);
+    }
+    let mut additional_params = serde_json::Map::new();
+    if let Some(top_p) = req.top_p {
+        additional_params.insert("top_p".into(), json!(top_p));
+    }
+    if let Some(stop) = &req.stop {
+        additional_params.insert("stop".into(), stop.as_value());
+    }
+    if let Some(penalty) = req.frequency_penalty {
+        additional_params.insert("frequency_penalty".into(), json!(penalty));
+    }
+    if let Some(penalty) = req.presence_penalty {
+        additional_params.insert("presence_penalty".into(), json!(penalty));
+    }
+    if !additional_params.is_empty() {
+        runner = runner.merge_additional_params(additional_params);
+    }
 
     if req.stream {
         let id = completion_id();
         let model = req.model.clone();
-        let run = agent.prompt(prompt).history(history).stream();
+        let run = runner.stream();
         let timeout = control.timeout;
         let events = tokio_stream::StreamExt::timeout(run, timeout)
             .scan(false, |timed_out, item| {
@@ -203,7 +263,7 @@ async fn chat(
         return Ok(Sse::new(events).into_response());
     }
 
-    match tokio::time::timeout(control.timeout, agent.prompt(prompt).history(history)).await {
+    match tokio::time::timeout(control.timeout, runner).await {
         Ok(Ok(res)) => Ok(Json(json!(ChatResponse {
             id: completion_id(),
             object: "chat.completion",
@@ -232,6 +292,56 @@ async fn chat(
             "upstream request timed out",
         )),
     }
+}
+
+fn validate_chat_request(req: &ChatRequest) -> Result<(), (StatusCode, Json<Value>)> {
+    if !req.unsupported_fields.is_empty() {
+        let mut names: Vec<_> = req.unsupported_fields.keys().cloned().collect();
+        names.sort();
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            &format!("unsupported request field(s): {}", names.join(", ")),
+        ));
+    }
+    if req.max_tokens.is_some() && req.max_completion_tokens.is_some() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "specify only one of max_tokens or max_completion_tokens",
+        ));
+    }
+    if req.max_tokens.or(req.max_completion_tokens) == Some(0) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "max_tokens must be greater than zero",
+        ));
+    }
+    if req
+        .temperature
+        .is_some_and(|value| !(0.0..=2.0).contains(&value))
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "temperature must be between 0 and 2",
+        ));
+    }
+    if req.top_p.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "top_p must be between 0 and 1",
+        ));
+    }
+    if req
+        .frequency_penalty
+        .into_iter()
+        .chain(req.presence_penalty)
+        .any(|value| !(-2.0..=2.0).contains(&value))
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "frequency_penalty and presence_penalty must be between -2 and 2",
+        ));
+    }
+    Ok(())
 }
 
 fn conversation(
@@ -331,6 +441,44 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn chat_request_rejects_unsupported_fields_instead_of_ignoring_them() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hello"}],
+            "n": 2
+        }))
+        .expect("request decodes so the field can be reported");
+        let (status, _) = validate_chat_request(&request).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn chat_request_validates_generation_option_ranges_and_conflicts() {
+        let conflicting: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 10,
+            "max_completion_tokens": 10
+        }))
+        .unwrap();
+        assert_eq!(
+            validate_chat_request(&conflicting).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let invalid_temperature: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 2.1
+        }))
+        .unwrap();
+        assert_eq!(
+            validate_chat_request(&invalid_temperature).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn health_is_open_but_models_requires_the_bearer_token() {
         let registry = crate::agent::test_registry("http://127.0.0.1:1/v1");
@@ -367,9 +515,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_json_returns_an_openai_shaped_bad_request() {
+        let registry = crate::agent::test_registry("http://127.0.0.1:1/v1");
+        let app = router(registry, None, RequestLimits::default());
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "riggate_error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid request body"));
+    }
+
+    #[tokio::test]
     async fn chat_completion_works_against_a_local_openai_compatible_server() {
-        let completion = post(|| async {
-            Json(json!({
+        let received_request = Arc::new(std::sync::Mutex::new(None));
+        let received = received_request.clone();
+        let completion = post(move |Json(request): Json<Value>| {
+            let received = received.clone();
+            async move {
+                *received.lock().unwrap() = Some(request);
+                Json(json!({
                 "id": "mock-completion",
                 "object": "chat.completion",
                 "created": 1,
@@ -380,7 +558,8 @@ mod tests {
                     "finish_reason": "stop"
                 }],
                 "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-            }))
+                }))
+            }
         });
         let mock_provider = Router::new()
             .route("/v1/chat/completions", completion.clone())
@@ -397,7 +576,7 @@ mod tests {
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model":"mock","messages":[{"role":"user","content":"hello"}]}"#,
+                        r#"{"model":"mock","messages":[{"role":"user","content":"hello"}],"temperature":0.3,"max_tokens":42,"top_p":0.8,"stop":["END"],"frequency_penalty":0.2}"#,
                     ))
                     .unwrap(),
             )
@@ -414,6 +593,12 @@ mod tests {
             "mock answer"
         );
         assert_eq!(completion["model"], "mock");
+        let upstream = received_request.lock().unwrap().clone().unwrap();
+        assert_eq!(upstream["temperature"], 0.3);
+        assert_eq!(upstream["max_tokens"], 42);
+        assert_eq!(upstream["top_p"], 0.8);
+        assert_eq!(upstream["stop"], json!(["END"]));
+        assert_eq!(upstream["frequency_penalty"], 0.2);
 
         server.abort();
     }

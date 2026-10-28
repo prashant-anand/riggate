@@ -73,6 +73,11 @@ The API accepts system, user, and assistant text messages. Earlier messages are 
 conversation history, and the latest user message starts the agent run. With `stream: true`,
 responses are streamed as OpenAI-compatible server-sent events.
 
+Chat requests support `temperature` (0–2), `top_p` (0–1), `max_tokens` or
+`max_completion_tokens`, `stop`, `frequency_penalty`, and `presence_penalty`. The two token limit
+fields cannot be sent together. Unknown fields and invalid option values return a `400` with an
+error message instead of being silently ignored.
+
 Errors are honest: an unknown model is `404`, an invalid request is `400`, and an upstream
 provider failure is `502` carrying the provider's own message (or an error event if streaming
 has already started).
