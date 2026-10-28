@@ -22,6 +22,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+      # Catches a package that cannot be produced (missing files, bad manifest) on every
+      # push, instead of at the tag, where a failed publish leaves the version half-released.
+      - run: cargo package --locked --no-verify
       # Audit runs last on purpose: a lockfile-only advisory should not skip the tests and the
       # release build, which are the checks that actually catch regressions in this codebase.
       - uses: rustsec/audit-check@v2
