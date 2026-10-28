@@ -5503,6 +5503,7 @@ dependencies = [
  "subtle",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

@@ -52,7 +52,10 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
             let tool_server = rig::tool::server::ToolServer::new().run();
             for server in &cfg.mcp_servers {
                 mcp_services.push(connect_mcp(server, &tool_server).await.with_context(|| {
-                    format!("connecting MCP server {} for agent '{}'", server.url, cfg.name)
+                    format!(
+                        "connecting MCP server {} for agent '{}'",
+                        server.url, cfg.name
+                    )
                 })?);
             }
             builder = builder.tool_server_handle(tool_server);
@@ -65,6 +68,21 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
         agents,
         _mcp_services: Mutex::new(mcp_services),
     }))
+}
+
+#[cfg(test)]
+pub(crate) fn test_registry(base_url: &str) -> Registry {
+    let client = openai::OpenAIConfig::new("test-key")
+        .with_base_url(base_url)
+        .with_route(openai::Route::Chat)
+        .client();
+    let agent = AgentBuilder::new(client.completion("mock-model")).build();
+    let mut agents = HashMap::new();
+    agents.insert("mock".to_string(), agent);
+    Arc::new(AgentRegistry {
+        agents,
+        _mcp_services: Mutex::new(Vec::new()),
+    })
 }
 
 fn build_agent(builder: AgentBuilder, cfg: &AgentConfig) -> Agent {

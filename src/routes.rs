@@ -222,6 +222,8 @@ fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
 
     fn message(role: &str, content: &str) -> Message {
         Message {
@@ -264,5 +266,88 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn health_is_open_but_models_requires_the_bearer_token() {
+        let registry = crate::agent::test_registry("http://127.0.0.1:1/v1");
+        let app = router(registry, Some("test-token".into()));
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let models = app
+            .oneshot(
+                Request::get("/v1/models")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn chat_completion_works_against_a_local_openai_compatible_server() {
+        let completion = post(|| async {
+            Json(json!({
+                "id": "mock-completion",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "mock-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "mock answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+            }))
+        });
+        let mock_provider = Router::new()
+            .route("/v1/chat/completions", completion.clone())
+            .route("/chat/completions", completion);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, mock_provider).await.unwrap() });
+        let registry = crate::agent::test_registry(&format!("http://{address}/v1"));
+        let app = router(registry, None);
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"mock","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let completion: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            completion["choices"][0]["message"]["content"],
+            "mock answer"
+        );
+        assert_eq!(completion["model"], "mock");
+
+        server.abort();
     }
 }
