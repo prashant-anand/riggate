@@ -1,0 +1,31 @@
+# cargo-audit configuration.
+#
+# Riggate builds a small dependency graph, but Cargo's lockfile is feature-agnostic: optional
+# dependencies of dependencies are locked and audited even when their feature is off.
+#
+# The advisories below are all in zstd / zstd-safe, reached only through rig's optional vector
+# store chain:
+#
+#     rig -> rig-lancedb -> lancedb -> lance-encoding -> zstd -> zstd-safe
+#
+# That chain is not in the build graph today. Verified with:
+#
+#     cargo tree -i zstd --target all          # nothing to print
+#     cargo tree -i zstd --target x86_64-unknown-linux-musl
+#     strings target/release/riggate | grep -c zstd   # 0
+#
+# Remove these ignores the moment the lancedb feature is enabled, or when rig updates the
+# chain past zstd 0.14.3 / zstd-safe 8.2.0. At that point the advisories are live.
+#
+# Only vulnerabilities are ignored: they fail the check. The informational `unsound` advisories
+# on the same crates stay as warnings on purpose, so the signal is not hidden.
+
+[advisories]
+ignore = [
+    # zstd 0.13.3: abandoned stream context leaks data into the next stream (memory-exposure).
+    "RUSTSEC-2026-0391",
+    # zstd-safe 7.3.0: Seekable::decompress sets a Vec length beyond capacity (memory-corruption).
+    "RUSTSEC-2026-0398",
+    # zstd-safe 7.3.0: uninitialized memory on a failed legacy-frame stream decode.
+    "RUSTSEC-2026-0403",
+]

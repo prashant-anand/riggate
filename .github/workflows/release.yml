@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - 'v*'
+  # Lets the whole matrix run from the Actions tab, so the musl link can be proven before a
+  # release tag exists.
+  workflow_dispatch:
 
 permissions:
   contents: write

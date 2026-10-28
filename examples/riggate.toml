@@ -1,0 +1,45 @@
+# Example Riggate configuration.
+#
+#   riggate check --config examples/riggate.toml    # parse and validate, no network
+#   riggate serve --config examples/riggate.toml    # start the server
+#
+# Every agent below is built at startup, so each provider you leave enabled needs its
+# credentials in the environment: an `openai` agent needs OPENAI_API_KEY. Comment out the
+# agent you are not using before a first run.
+
+bind = "127.0.0.1:8080"
+
+# Request controls. These are the defaults, shown here so they are discoverable.
+max_request_bytes = 1048576
+max_concurrent_requests = 64
+request_timeout_seconds = 120
+
+# Unknown request fields are accepted and ignored. Set true to reject them with a 400.
+strict_requests = false
+
+# A local model. Clients send "local" as the model name.
+# Needs a running Ollama that already has the model pulled.
+[[agents]]
+name = "local"
+provider = "ollama"
+model = "gemma4:12b"
+preamble = "You are a helpful assistant. Keep answers short."
+max_turns = 10
+
+# Optional MCP tools for the agent above. Riggate connects at startup and fails fast if the
+# endpoint is unreachable, so this stays commented until there is a server to point at.
+# An empty `allowed_tools` list disables every tool from that server.
+#
+# [[agents.mcp_servers]]
+# url = "http://127.0.0.1:9000/mcp"
+# bearer_token_env = "MCP_SEARCH_TOKEN"
+# allowed_tools = ["search", "read"]
+
+# A hosted model. Requires OPENAI_API_KEY. Clients send "assistant" as the model name.
+# Comment this block out to run with only the local model and no hosted credential.
+[[agents]]
+name = "assistant"
+provider = "openai"
+model = "gpt-5.5"
+preamble = "You are a helpful assistant."
+max_turns = 10

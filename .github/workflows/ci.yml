@@ -20,8 +20,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      # Audit runs last on purpose: a lockfile-only advisory should not skip the tests and the
+      # release build, which are the checks that actually catch regressions in this codebase.
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo test --locked
-      - run: cargo build --release --locked
