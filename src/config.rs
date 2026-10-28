@@ -34,6 +34,22 @@ pub struct AgentConfig {
     /// System prompt.
     #[serde(default)]
     pub preamble: Option<String>,
+    /// Maximum model calls per request, including tool follow-ups.
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
+    /// MCP servers whose tools should be available to this agent.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+fn default_max_turns() -> usize {
+    10
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpServerConfig {
+    /// Streamable HTTP endpoint for the MCP server.
+    pub url: String,
 }
 
 impl Config {
@@ -52,6 +68,14 @@ impl Config {
         for a in &cfg.agents {
             if a.name.trim().is_empty() {
                 bail!("an agent has an empty name");
+            }
+            if a.max_turns == 0 {
+                bail!("agent '{}' max_turns must be greater than zero", a.name);
+            }
+            for server in &a.mcp_servers {
+                if server.url.trim().is_empty() {
+                    bail!("agent '{}' has an MCP server with an empty url", a.name);
+                }
             }
         }
         Ok(cfg)

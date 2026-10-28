@@ -1,11 +1,20 @@
 use axum::{
     extract::{Json, State},
     http::StatusCode,
+    response::sse::{Event, Sse},
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
+use futures_util::{stream, StreamExt};
+use rig::{
+    agent::MultiTurnStreamItem,
+    completion::Message as RigMessage,
+    streaming::{Item, StreamEvent},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::convert::Infallible;
 
 use crate::agent::Registry;
 
@@ -26,7 +35,7 @@ async fn health() -> &'static str {
 async fn models(State(agents): State<Registry>) -> Json<Value> {
     let data: Vec<Value> = agents
         .keys()
-        .map(|name| json!({"id": name, "object": "model", "owned_by": "sallyport"}))
+        .map(|name| json!({"id": name, "object": "model", "owned_by": "riggate"}))
         .collect();
     Json(json!({"object": "list", "data": data}))
 }
@@ -80,14 +89,7 @@ struct ChatResponse {
 async fn chat(
     State(agents): State<Registry>,
     Json(req): Json<ChatRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if req.stream {
-        return Err(err(
-            StatusCode::NOT_IMPLEMENTED,
-            "streaming is not implemented yet; send stream=false",
-        ));
-    }
-
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let agent = agents.get(&req.model).ok_or_else(|| {
         err(
             StatusCode::NOT_FOUND,
@@ -95,25 +97,77 @@ async fn chat(
         )
     })?;
 
-    // Everything except the last user turn is folded into the preamble by the
-    // client; v0.1 runs a single-turn prompt.
-    let prompt = req
+    let prompt_index = req
         .messages
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no messages in request"))?;
+    if req.messages[prompt_index].role != "user" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "the last message must have the user role",
+        ));
+    }
+    let prompt = req.messages[prompt_index].content.clone();
+    let history = req.messages[..prompt_index]
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no user message in request"))?;
+        .map(|message| match message.role.as_str() {
+            "system" => Ok(RigMessage::system(message.content.clone())),
+            "user" => Ok(RigMessage::user(message.content.clone())),
+            "assistant" => Ok(RigMessage::assistant(message.content.clone())),
+            role => Err(err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "unsupported message role '{role}'; supported roles are system, user, assistant"
+                ),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    match agent.prompt(&prompt).await {
+    if req.stream {
+        let id = completion_id();
+        let model = req.model.clone();
+        let run = agent.prompt(prompt).history(history).stream();
+        let events = run
+            .filter_map(move |item| {
+                let id = id.clone();
+                let model = model.clone();
+                async move {
+                    let chunk = match item {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(
+                            StreamEvent::Text { text, .. },
+                        ))) => json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                        }),
+                        Ok(MultiTurnStreamItem::FinalResponse(_)) => json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        }),
+                        Err(error) => json!({
+                            "error": {
+                                "message": format!("upstream error: {error}"),
+                                "type": "riggate_error"
+                            }
+                        }),
+                        _ => return None,
+                    };
+                    Some(Ok::<Event, Infallible>(Event::default().data(chunk.to_string())))
+                }
+            })
+            .chain(stream::iter([Ok::<Event, Infallible>(
+                Event::default().data("[DONE]"),
+            )]));
+        return Ok(Sse::new(events).into_response());
+    }
+
+    match agent.prompt(prompt).history(history).await {
         Ok(res) => Ok(Json(json!(ChatResponse {
-            id: format!(
-                "chatcmpl-{:x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ),
+            id: completion_id(),
             object: "chat.completion",
             model: req.model.clone(),
             choices: vec![ChatChoice {
@@ -129,7 +183,8 @@ async fn chat(
                 completion_tokens: res.usage.output_tokens,
                 total_tokens: res.usage.total_tokens,
             },
-        }))),
+        }))
+        .into_response()),
         // A provider failure is not a client error — surface it as 502.
         Err(e) => Err(err(
             StatusCode::BAD_GATEWAY,
@@ -138,9 +193,19 @@ async fn chat(
     }
 }
 
+fn completion_id() -> String {
+    format!(
+        "chatcmpl-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
 fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<Value>) {
     (
         code,
-        Json(json!({"error": {"message": msg, "type": "sallyport_error"}})),
+        Json(json!({"error": {"message": msg, "type": "riggate_error"}})),
     )
 }

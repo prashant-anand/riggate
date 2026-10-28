@@ -19,7 +19,7 @@ default we chose for them. Most "it leaked to the internet" incidents are defaul
 ## OpenAI's HTTP shape, not our own
 
 Clients, SDKs, gateways, and eval harnesses already speak `/v1/chat/completions`. Speaking
-it means zero integration work to try `sallyport`, and it lets an existing OpenAI client
+it means zero integration work to try `riggate`, and it lets an existing OpenAI client
 keep working when the endpoint underneath changes to a local model.
 
 Cost: we inherit a specification we do not control, including fields we ignore.
@@ -33,10 +33,34 @@ holds only names, models, and prompts.
 ## Errors carry meaning
 
 - unknown model → `404`, with the list endpoint named in the message
-- unsupported stream → `501`, not a silent non-streamed reply
+- malformed request → `400`, with the supported roles named
 - upstream failure → `502` with the provider's message intact
 
-A server that returns `200` with an error string inside is untestable by monitoring.
+Once a stream has started, an upstream failure is sent as an SSE error event because the
+HTTP status can no longer be changed.
+
+## Requests carry their own conversation history
+
+The server does not keep user conversations in memory. Each OpenAI-compatible request
+supplies its previous system, user, and assistant text messages; the server passes those to
+Rig as history and runs the latest user message. This keeps the binary stateless and lets
+clients own conversation storage.
+
+## Streaming follows Rig's agent stream
+
+`stream: true` maps Rig's text events into OpenAI-compatible SSE chunks. Tool and lifecycle
+events are not exposed in the HTTP stream yet; the final response and `[DONE]` marker follow
+the text chunks.
+
+## Tools come from MCP servers
+
+An agent may configure Streamable HTTP MCP endpoints. At startup Riggate connects each
+endpoint, registers its tools with Rig, and holds the connection for the agent's lifetime.
+`max_turns` bounds the model calls made by a request, including tool follow-ups. This makes
+tools configurable without compiling tool implementations into the server binary.
+
+For non-streaming requests, failures use HTTP status codes rather than returning `200` with
+an error string inside, which would be untestable by monitoring.
 
 ## Agents built once, at boot
 

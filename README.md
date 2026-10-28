@@ -1,13 +1,13 @@
-# sallyport
+# riggate
 
 **A single-binary agent server for air-gapped networks.** Bring your own model.
 
-A sally port is the one controlled gate into a fortress. That is this: a small, auditable
-door through which a network lets an AI agent work — and nothing else crosses.
+Riggate combines Rig, the Rust agent framework, with the idea of a controlled gateway:
+a small, auditable door through which a network lets an AI agent work.
 
 ```
-$ sallyport serve
-2026-10-28T11:22:04Z  INFO sallyport: sallyport listening bind=127.0.0.1:8080 agents=1
+$ riggate serve
+2026-10-28T11:22:04Z  INFO riggate: riggate listening bind=127.0.0.1:8080 agents=1
 ```
 
 ## Why
@@ -16,7 +16,7 @@ Most agent infrastructure assumes the cloud. For a bank, a hospital, or a captiv
 that assumption ends the project at the security review: the agent runs in someone else's
 datacentre, or it doesn't run.
 
-`sallyport` takes the opposite position.
+`riggate` takes the opposite position.
 
 - **One file.** No interpreter, no container runtime, no package manager. Copy it, run it.
 - **Your network.** Binds to loopback by default. Egress goes only where you point it.
@@ -38,9 +38,9 @@ datacentre, or it doesn't run.
 
 ```bash
 cargo install --path .
-cp examples/sallyport.toml sallyport.toml
-sallyport check --config sallyport.toml
-sallyport serve --config sallyport.toml
+cp examples/riggate.toml riggate.toml
+riggate check --config riggate.toml
+riggate serve --config riggate.toml
 ```
 
 Then, from any OpenAI-compatible client:
@@ -65,8 +65,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 | `GET` | `/v1/models` | configured agents, OpenAI shape |
 | `POST` | `/v1/chat/completions` | run one agent |
 
-Errors are honest: an unknown model is `404`, streaming is `501`, and an upstream provider
-failure is `502` carrying the provider's own message.
+The API accepts system, user, and assistant text messages. Earlier messages are sent as
+conversation history, and the latest user message starts the agent run. With `stream: true`,
+responses are streamed as OpenAI-compatible server-sent events.
+
+Errors are honest: an unknown model is `404`, an invalid request is `400`, and an upstream
+provider failure is `502` carrying the provider's own message (or an error event if streaming
+has already started).
 
 ## Configuration
 
@@ -78,7 +83,17 @@ name = "assistant"                # the value clients send as "model"
 provider = "openai"               # openai | ollama
 model = "gpt-5.5"
 preamble = "You are a helpful assistant."
+max_turns = 10                     # model calls per request, including tool follow-ups
+
+[[agents.mcp_servers]]
+url = "http://127.0.0.1:9000/mcp" # Streamable HTTP MCP endpoint
 ```
+
+MCP server tools are discovered when Riggate starts and refreshed when the server announces
+tool-list changes. Keep the configured agent's `max_turns` high enough for tool calls and
+follow-up model responses. MCP endpoints must be reachable from the Riggate host. This
+version supports Streamable HTTP endpoints; stdio transport and per-server auth configuration
+are not available yet.
 
 Provider endpoints and credentials come from the environment, never the config file:
 
@@ -90,15 +105,11 @@ Provider endpoints and credentials come from the environment, never the config f
 
 ## Status
 
-`v0.1` — single-turn agents over an OpenAI-compatible HTTP surface. Deliberately small.
+`v0.1` — conversational agents over an OpenAI-compatible HTTP surface. Deliberately small.
 
 Not yet implemented, in order of intent:
 
-1. **Streaming** (`stream: true`) — currently `501`
-2. **Multi-turn** — conversation history is not carried between requests
-3. **Tools** — typed function calling via `#[rig::rig_tool]`
-4. **MCP** — expose MCP servers as tool sources (Rig's `rmcp` feature)
-5. **Retrieval** — RAG over a vector store you host
+1. **Retrieval** — RAG over a vector store you host
 
 This is not a hosted platform, an orchestrator, or a multi-agent framework. It is one
 binary that runs one or more configured agents behind a boring HTTP API.
