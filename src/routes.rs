@@ -1038,6 +1038,134 @@ mod tests {
         server.abort();
     }
 
+    /// The end-to-end path: a model drives a permitted tool call and the round trip completes.
+    ///
+    /// What this proves: the gateway advertises the permitted tool to the model, executes it
+    /// when the model asks, feeds the output back, and returns the model's final answer.
+    ///
+    /// What it does not prove: that a model will reliably *choose* a tool you want it to
+    /// choose. Tool-selection quality varies by model and run, which is why the allowlist
+    /// boundary is a separate, model-free test in `agent::tests` rather than an assertion on
+    /// what the model happened to request here.
+    #[tokio::test]
+    async fn a_permitted_tool_is_invoked_by_the_model_and_its_result_returns_to_the_model() {
+        use std::sync::atomic::AtomicUsize;
+
+        let requests: Arc<std::sync::Mutex<Vec<Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool_invocations = Arc::new(AtomicUsize::new(0));
+
+        let recorded = requests.clone();
+        let completion = post(move |Json(request): Json<Value>| {
+            let recorded = recorded.clone();
+            async move {
+                let turn = {
+                    let mut requests = recorded.lock().unwrap();
+                    requests.push(request);
+                    requests.len()
+                };
+                if turn == 1 {
+                    // Turn one: the model asks for the one tool it was offered.
+                    Json(json!({
+                        "id": "mock-tool-call",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "mock-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_time",
+                                        "arguments": "{\"city\":\"Hyderabad\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    }))
+                } else {
+                    Json(json!({
+                        "id": "mock-final",
+                        "object": "chat.completion",
+                        "created": 2,
+                        "model": "mock-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "The time is 12:00."},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
+                    }))
+                }
+            }
+        });
+        let provider = Router::new()
+            .route("/v1/chat/completions", completion.clone())
+            .route("/chat/completions", completion);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+
+        let registry = crate::agent::test_registry_with_tools(
+            &format!("http://{address}/v1"),
+            Some(vec!["get_time".to_string()]),
+            tool_invocations.clone(),
+        );
+        let app = router(registry, None, RequestLimits::default());
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"mock","messages":[{"role":"user","content":"What time is it in Hyderabad?"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let completion: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "The time is 12:00.",
+            "the caller must receive the model's final answer, not the raw tool call"
+        );
+
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a tool round trip is two provider calls: the model asks, then answers"
+        );
+        let offered = requests[0]["tools"].to_string();
+        assert!(
+            offered.contains("get_time"),
+            "the permitted tool must be advertised to the model or it could never be chosen; \
+             offered: {offered}"
+        );
+        assert_eq!(
+            tool_invocations.load(Ordering::SeqCst),
+            1,
+            "the model asked once, so the gateway must execute the tool exactly once"
+        );
+        assert!(
+            requests[1].to_string().contains("12:00"),
+            "the tool's output must be fed back to the model, not swallowed; second request: {}",
+            requests[1]
+        );
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn rejects_requests_larger_than_the_configured_body_limit() {
         let registry = crate::agent::test_registry("http://127.0.0.1:1/v1");

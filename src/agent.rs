@@ -91,6 +91,59 @@ pub(crate) fn test_registry(base_url: &str) -> Registry {
     })
 }
 
+/// Like [`test_registry`], but the agent owns a tool server holding one permitted tool,
+/// `get_time`. The tool counts its own invocations so a test can tell "the model asked"
+/// apart from "the gateway actually ran it".
+///
+/// `allowlist` is applied through the real [`FilteredToolSink`], so a test built on this
+/// exercises the same policy code the server uses, not a shortcut.
+#[cfg(test)]
+pub(crate) fn test_registry_with_tools(
+    base_url: &str,
+    allowlist: Option<Vec<String>>,
+    invoked: Arc<std::sync::atomic::AtomicUsize>,
+) -> Registry {
+    let client = openai::OpenAIConfig::new("test-key")
+        .with_base_url(base_url)
+        .with_route(openai::Route::Chat)
+        .client();
+    let tool_server = rig::tool::server::ToolServer::new().run();
+    let sink = FilteredToolSink {
+        inner: tool_server.clone(),
+        allowlist: allowlist.map(|names| names.into_iter().collect()),
+        agent: "mock".to_string(),
+        server: "http://127.0.0.1:9/mcp".to_string(),
+    };
+    let tool = DynamicTool::new(
+        rig::message::ToolName::new("get_time").expect("valid tool name"),
+        "Look up the current time in a city",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+        }),
+        move |_| {
+            let invoked = invoked.clone();
+            Box::pin(async move {
+                invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(rig::tool::ToolOutput::text("12:00"))
+            })
+        },
+    );
+    sink.add_managed_tools(vec![tool]);
+
+    let agent = AgentBuilder::new(client.completion("mock-model"))
+        .tool_server_handle(tool_server)
+        .default_max_turns(4)
+        .build();
+    let mut agents = HashMap::new();
+    agents.insert("mock".to_string(), agent);
+    Arc::new(AgentRegistry {
+        agents,
+        _mcp_services: Mutex::new(Vec::new()),
+    })
+}
+
 fn build_agent(builder: AgentBuilder, cfg: &AgentConfig) -> Agent {
     match &cfg.preamble {
         Some(p) => builder.preamble(p).build(),
@@ -356,5 +409,141 @@ mod tests {
         let catalog = handle.snapshot();
         assert!(!catalog.contains("search"));
         assert!(!catalog.contains("delete"));
+    }
+
+    /// Captures what `tracing` actually emits.
+    ///
+    /// The security claim is "a denied tool is visible in the log", and a test that only
+    /// inspects the tool catalog cannot see a log line at all. `tracing` caches callsite
+    /// interest globally, so a callsite first evaluated while no subscriber was installed
+    /// can stay permanently disabled and the assertion would fail on a test-ordering
+    /// accident. `rebuild_interest_cache` is the documented reset, and it only takes effect
+    /// inside the subscriber's scope, so it is called there.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("log buffer is not poisoned")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Buffer;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
+
+        let captured = buffer.0.lock().expect("log buffer is not poisoned").clone();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    const TEST_SERVER: &str = "http://mcp.internal:8931/mcp";
+
+    fn named_tool(name: &'static str) -> DynamicTool {
+        DynamicTool::new(
+            rig::message::ToolName::new(name).expect("valid tool name"),
+            "test tool",
+            serde_json::json!({"type": "object"}),
+            |_| Box::pin(async { Ok(rig::tool::ToolOutput::text("ok")) }),
+        )
+    }
+
+    /// The negative case that decides a security review: an MCP server advertises a tool,
+    /// `allowed_tools` omits it, so it must never be registered — and the refusal must be
+    /// greppable, naming the server and the tool.
+    ///
+    /// Deliberately model-free. Asking a language model to reach for a forbidden tool would
+    /// make this assertion depend on model behaviour, which is not stable across runs or
+    /// models, and a flaky security test teaches you to re-run until it goes green.
+    #[test]
+    fn a_tool_offered_but_not_allowlisted_is_refused_and_the_refusal_names_server_and_tool() {
+        let handle = rig::tool::server::ToolServer::new().run();
+        let sink = FilteredToolSink {
+            inner: handle.clone(),
+            allowlist: Some(HashSet::from(["search".to_string()])),
+            agent: "bank-agent".to_string(),
+            server: TEST_SERVER.to_string(),
+        };
+
+        let logs = capture_logs(|| {
+            sink.add_managed_tools(vec![named_tool("search"), named_tool("delete")]);
+        });
+
+        assert!(
+            handle.snapshot().contains("search"),
+            "the allowlisted tool must still be registered"
+        );
+        assert!(
+            !handle.snapshot().contains("delete"),
+            "a tool outside allowed_tools must never reach the catalog"
+        );
+
+        assert!(
+            logs.contains("tool=delete") && logs.contains("allowed=false"),
+            "the denial must name the tool that was refused; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains(TEST_SERVER),
+            "the denial must name the MCP server, or it cannot be reconciled against the \
+             config that produced it; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains("agent=bank-agent"),
+            "the denial must name the agent; captured:\n{logs}"
+        );
+    }
+
+    /// Deny-by-default is only usable if an operator who forgot `allowed_tools` is told so,
+    /// and told which server to go and fix.
+    #[test]
+    fn an_absent_allowlist_registers_nothing_and_warns_with_the_server_to_fix() {
+        let handle = rig::tool::server::ToolServer::new().run();
+        let sink = FilteredToolSink {
+            inner: handle.clone(),
+            allowlist: None,
+            agent: "bank-agent".to_string(),
+            server: TEST_SERVER.to_string(),
+        };
+
+        let logs = capture_logs(|| {
+            sink.add_managed_tools(vec![named_tool("search")]);
+        });
+
+        assert!(!handle.snapshot().contains("search"));
+        assert!(
+            logs.contains("allowed_tools is not set"),
+            "an operator who omitted the field must be told why nothing registered; \
+             captured:\n{logs}"
+        );
+        assert!(
+            logs.contains(TEST_SERVER),
+            "the warning must name the server to fix; captured:\n{logs}"
+        );
     }
 }
