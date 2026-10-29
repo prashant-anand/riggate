@@ -59,8 +59,8 @@ struct AppState {
 /// How a streaming response actually ended. Once the first token is sent the HTTP status is
 /// already 200, so the status alone cannot say whether the stream finished, failed upstream,
 /// timed out, or was abandoned by the client — which is the difference an operator cares about.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamOutcome {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StreamOutcome {
     Open,
     Completed,
     UpstreamError,
@@ -105,16 +105,26 @@ struct RequestCompletionGuard {
 }
 
 impl RequestCompletionGuard {
-    fn new(span: tracing::Span, started: tokio::time::Instant) -> (Self, Arc<AtomicU8>) {
-        let outcome = Arc::new(AtomicU8::new(StreamOutcome::Open.as_u8()));
-        (
-            Self {
-                span,
-                started,
-                outcome: Arc::clone(&outcome),
-            },
+    fn new(span: tracing::Span, started: tokio::time::Instant, outcome: Arc<AtomicU8>) -> Self {
+        Self {
+            span,
+            started,
             outcome,
-        )
+        }
+    }
+}
+
+/// The terminal state of a streamed response, attached to the response so the value that drives
+/// the log line can be asserted directly instead of being scraped back out of a log. Test-only:
+/// nothing in the server reads it, and it must not become a way to smuggle state to callers.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct StreamOutcomeHandle(Arc<AtomicU8>);
+
+#[cfg(test)]
+impl StreamOutcomeHandle {
+    pub(crate) fn outcome(&self) -> StreamOutcome {
+        StreamOutcome::from_u8(self.0.load(Ordering::Relaxed))
     }
 }
 
@@ -294,12 +304,14 @@ async fn chat(
     let request_id = completion_id();
     let span = tracing::info_span!("chat.request", request_id = %request_id, agent = tracing::field::Empty, status = tracing::field::Empty, outcome = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
     let started = tokio::time::Instant::now();
+    let outcome = Arc::new(AtomicU8::new(StreamOutcome::Open.as_u8()));
     let result = chat_inner(
         State(state),
         Extension(control),
         request,
         started,
         request_id.clone(),
+        Arc::clone(&outcome),
     )
     .instrument(span.clone())
     .await;
@@ -315,6 +327,10 @@ async fn chat(
             .headers_mut()
             .insert(HeaderName::from_static("x-request-id"), value);
     }
+    #[cfg(test)]
+    response
+        .extensions_mut()
+        .insert(StreamOutcomeHandle(Arc::clone(&outcome)));
 
     let status = response.status();
     let is_stream = response
@@ -344,6 +360,7 @@ async fn chat_inner(
     request: Result<Json<ChatRequest>, JsonRejection>,
     started: tokio::time::Instant,
     request_id: String,
+    outcome: Arc<AtomicU8>,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let Json(req) = request.map_err(|rejection| {
         let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -408,7 +425,12 @@ async fn chat_inner(
         let run = runner.stream();
         let timeout = control.timeout;
         let span = tracing::Span::current();
-        let (completion_guard, outcome) = RequestCompletionGuard::new(span.clone(), started);
+        let completion_guard =
+            RequestCompletionGuard::new(span.clone(), started, Arc::clone(&outcome));
+        // Kept for the end-of-source check: the source ending with no terminal event is an
+        // upstream truncation, not a client hanging up (a client hang-up drops this future
+        // before the check can run).
+        let end_outcome = Arc::clone(&outcome);
         // A per-item timeout alone lets a slow drip hold the permit forever, so
         // the same Instant bounds the whole stream as well.
         let deadline = tokio::time::Instant::now() + timeout;
@@ -481,6 +503,29 @@ async fn chat_inner(
                     Some(Ok::<Event, Infallible>(Event::default().data(chunk.to_string())))
                 }
             })
+            .chain(
+                stream::once(async move {
+                    // Reached only when the source ended on its own. If nothing terminal was
+                    // recorded, the upstream stopped mid-answer; telling the client [DONE]
+                    // alone would report a truncated answer as complete.
+                    if StreamOutcome::from_u8(end_outcome.load(Ordering::Relaxed))
+                        == StreamOutcome::Open
+                    {
+                        end_outcome.store(StreamOutcome::UpstreamError.as_u8(), Ordering::Relaxed);
+                        let chunk = json!({
+                            "error": {
+                                "message": "upstream stream ended without a final response",
+                                "type": "riggate_error"
+                            }
+                        });
+                        return Some(Ok::<Event, Infallible>(
+                            Event::default().data(chunk.to_string()),
+                        ));
+                    }
+                    None
+                })
+                .filter_map(|item| async move { item }),
+            )
             .chain(stream::iter([Ok::<Event, Infallible>(
                 Event::default().data("[DONE]"),
             )]))
@@ -1158,6 +1203,191 @@ mod tests {
             .body(Body::from(
                 r#"{"model":"mock","messages":[{"role":"user","content":"hello"}]}"#,
             ))
+            .unwrap()
+    }
+
+    // --- stream outcomes: asserted through the value the log line is built from ---
+
+    fn outcome_handle(response: &axum::response::Response) -> StreamOutcomeHandle {
+        response
+            .extensions()
+            .get::<StreamOutcomeHandle>()
+            .expect("every response carries its outcome handle")
+            .clone()
+    }
+
+    async fn stream_router(timeout: Duration) -> (Router, tokio::task::JoinHandle<()>) {
+        let provider = Router::new()
+            .route("/v1/chat/completions", post(slow_stream_response))
+            .route("/chat/completions", post(slow_stream_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let registry = crate::agent::test_registry(&format!("http://{address}/v1"));
+        (
+            router(
+                registry,
+                None,
+                RequestLimits {
+                    timeout,
+                    ..RequestLimits::default()
+                },
+            ),
+            server,
+        )
+    }
+
+    fn stream_request() -> Request<Body> {
+        Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"mock","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_stream_ends_as_client_closed() {
+        // The status is already 200 by the first token, so a client that hangs up mid-answer
+        // would otherwise be indistinguishable from a request that finished.
+        let (app, server) = stream_router(Duration::from_secs(30)).await;
+        let response = app.oneshot(stream_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .expect("streams carry the request id too")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let outcome = outcome_handle(&response);
+
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.expect("a first chunk").unwrap();
+        assert!(
+            String::from_utf8_lossy(&first).contains(&format!("\"id\":\"{request_id}\"")),
+            "the chunk id must be the same value as the header"
+        );
+        assert_eq!(
+            outcome.outcome(),
+            StreamOutcome::Open,
+            "nothing terminal has happened yet"
+        );
+        drop(stream);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            outcome.outcome(),
+            StreamOutcome::Open,
+            "an abandoned stream is recorded as still open, which the log renders as client_closed"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_hits_the_deadline_ends_as_timed_out() {
+        // A provider that never finishes: the request deadline is what ends this stream.
+        let (app, server) = stream_router(Duration::from_secs(1)).await;
+        let response = app.oneshot(stream_request()).await.unwrap();
+        let outcome = outcome_handle(&response);
+        let body = tokio::time::timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        assert!(
+            body.contains("upstream request timed out"),
+            "body was {body}"
+        );
+        assert_eq!(outcome.outcome(), StreamOutcome::TimedOut);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_completed_stream_ends_as_completed() {
+        let provider = Router::new()
+            .route("/v1/chat/completions", post(completing_stream_response))
+            .route("/chat/completions", post(completing_stream_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let registry = crate::agent::test_registry(&format!("http://{address}/v1"));
+        let app = router(registry, None, RequestLimits::default());
+        let response = app.oneshot(stream_request()).await.unwrap();
+        let outcome = outcome_handle(&response);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        assert!(
+            body.contains("\"finish_reason\":\"stop\""),
+            "body was {body}"
+        );
+        assert!(body.contains("[DONE]"), "body was {body}");
+        assert_eq!(
+            outcome.outcome(),
+            StreamOutcome::Completed,
+            "body was {body}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_truncated_upstream_stream_is_reported_and_ends_as_an_error() {
+        let provider = Router::new()
+            .route("/v1/chat/completions", post(truncated_stream_response))
+            .route("/chat/completions", post(truncated_stream_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let registry = crate::agent::test_registry(&format!("http://{address}/v1"));
+        let app = router(registry, None, RequestLimits::default());
+        let response = app.oneshot(stream_request()).await.unwrap();
+        let outcome = outcome_handle(&response);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+
+        assert!(
+            body.contains("\"error\""),
+            "a client must not be told a truncated answer finished; body was {body}"
+        );
+        assert_eq!(
+            outcome.outcome(),
+            StreamOutcome::UpstreamError,
+            "body was {body}"
+        );
+        server.abort();
+    }
+
+    async fn completing_stream_response() -> axum::response::Response {
+        let body = [
+            "data: {\"id\":\"one\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"mock \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"one\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"one\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .concat();
+        axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn truncated_stream_response() -> axum::response::Response {
+        // Content, then the connection ends: no finish_reason, no usage, no [DONE].
+        let body = "data: {\"id\":\"cut\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+        axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
             .unwrap()
     }
 

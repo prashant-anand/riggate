@@ -257,6 +257,21 @@ preamble = "Be brief."
     }
 
     #[test]
+    fn defaults_shutdown_grace_to_ten_seconds() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        assert_eq!(Config::parse(raw).unwrap().shutdown_grace_seconds, 10);
+    }
+
+    #[test]
+    fn rejects_zero_shutdown_grace() {
+        let raw = "shutdown_grace_seconds = 0\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("shutdown_grace_seconds"));
+    }
+
+    #[test]
     fn parses_mcp_auth_and_tool_allowlist() {
         let raw = "[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n[[agents.mcp_servers]]\nurl=\"http://localhost/mcp\"\nbearer_token_env=\"MCP_TOKEN\"\nallowed_tools=[\"search\", \"read\"]\n";
         let cfg = Config::parse(raw).expect("MCP policy should parse");
