@@ -32,7 +32,10 @@ fn arg_value(args: &[String], flag: &str) -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Colour only when stderr is a terminal. Redirected logs go to a file, journald or a log
+    // pipeline, where escape sequences are noise in a line an operator needs to grep.
     tracing_subscriber::fmt()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "riggate=info".into()),
