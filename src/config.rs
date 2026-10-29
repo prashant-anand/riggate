@@ -131,6 +131,16 @@ impl Config {
                         a.name
                     );
                 }
+                // "*" means every tool, so mixing it with names hides which decision was
+                // actually made. Accept it alone or not at all.
+                if server.allowed_tools.as_ref().is_some_and(|tools| {
+                    tools.len() > 1 && tools.iter().any(|name| name.trim() == "*")
+                }) {
+                    bail!(
+                        "agent '{}' mixes \"*\" with tool names in an MCP allowlist; use \"*\" alone or name the tools",
+                        a.name
+                    );
+                }
             }
         }
         Ok(cfg)
@@ -253,5 +263,24 @@ preamble = "Be brief."
             .unwrap_err()
             .to_string()
             .contains("empty tool name"));
+    }
+
+    #[test]
+    fn accepts_the_wildcard_allowlist_alone() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n[[agents.mcp_servers]]\nurl=\"http://localhost/mcp\"\nallowed_tools=[\"*\"]\n";
+        let cfg = Config::parse(raw).expect("wildcard alone should parse");
+        assert_eq!(
+            cfg.agents[0].mcp_servers[0].allowed_tools.as_deref(),
+            Some(["*".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn rejects_mixing_the_wildcard_with_named_tools() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n[[agents.mcp_servers]]\nurl=\"http://localhost/mcp\"\nallowed_tools=[\"*\", \"search\"]\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes"));
     }
 }

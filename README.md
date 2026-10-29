@@ -115,10 +115,13 @@ url = "http://127.0.0.1:9000/mcp"
 
 The top-level request controls default to a 1 MiB body limit, 64 concurrent agent runs, and a
 120-second upstream timeout. Unknown request fields are ignored by default; set
-`strict_requests = true` to restore rejection of unknown fields. Set `allowed_tools` to restrict
-which tools an MCP server can provide. If omitted, all tools are available; an empty list
-disables all tools from that server. The allowlist also applies when the server refreshes its
-tool list.
+`strict_requests = true` to restore rejection of unknown fields.
+
+MCP tools are denied unless they are named. Omitting `allowed_tools`, or setting `[]`,
+registers no tools from that server. Set `allowed_tools = ["*"]` to register every discovered
+tool. Every decision is logged at startup with the agent, the tool name, and whether it was
+allowed, so the log is how you find the names to allow. The policy is applied again when the
+server refreshes its tool list.
 
 Set `bearer_token_env` to the name of an environment variable containing the MCP server's
 bearer token. Riggate reads the value when it starts and does not store credentials in the TOML

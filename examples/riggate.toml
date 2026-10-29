@@ -31,13 +31,13 @@ preamble = "You are a helpful assistant. Keep answers short." # Optional system 
 max_turns = 10 # Model calls per request, including tool follow-ups; must be > 0 (default: 10).
 
 # Optional MCP tools for the local agent above. Riggate connects at startup and fails fast if
-# the endpoint is unreachable. `allowed_tools` omitted allows all discovered tools; [] allows
-# none; a list allows only those tool names.
+# the endpoint is unreachable. Tools are denied unless named: `allowed_tools` omitted or []
+# registers none; ["*"] registers all discovered tools; a list registers only those names.
 #
 # [[agents.mcp_servers]]
 # url = "http://127.0.0.1:9000/mcp" # Reachable Streamable HTTP MCP endpoint.
 # bearer_token_env = "MCP_SEARCH_TOKEN" # Optional environment variable name for its bearer token.
-# allowed_tools = ["search", "read"]
+# allowed_tools = ["search", "read"] # Deny by default: name each tool the agent may use.
 
 # A hosted model. Comment out this block to run only the local model without OpenAI credentials.
 # Provider is "openai" or "ollama". This model requires OPENAI_API_KEY.

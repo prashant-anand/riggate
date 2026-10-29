@@ -147,15 +147,26 @@ struct FilteredToolSink {
 
 impl FilteredToolSink {
     fn filter(&self, tools: Vec<DynamicTool>) -> Vec<DynamicTool> {
-        tools
+        let discovered = tools.len();
+        let allowed: Vec<DynamicTool> = tools
             .into_iter()
             .filter_map(|tool| {
                 let name = tool.name();
-                let allowed = tool_allowed(self.allowlist.as_ref(), name.as_ref());
-                tracing::info!(agent = %self.agent, tool = %name, allowed, "MCP tool policy evaluated");
-                allowed.then(|| self.instrument_tool(tool))
+                let is_allowed = tool_allowed(self.allowlist.as_ref(), name.as_ref());
+                tracing::info!(agent = %self.agent, tool = %name, allowed = is_allowed, "MCP tool policy evaluated");
+                is_allowed.then(|| self.instrument_tool(tool))
             })
-            .collect()
+            .collect();
+        // Denying by default is only usable if the operator can see what was denied. This is
+        // the line that tells them which names to put in allowed_tools.
+        if self.allowlist.is_none() && discovered > 0 {
+            tracing::warn!(
+                agent = %self.agent,
+                discovered,
+                "MCP server offers tools but allowed_tools is not set; none are registered. Name them explicitly, or set allowed_tools = [\"*\"]"
+            );
+        }
+        allowed
     }
 
     fn instrument_tool(&self, tool: DynamicTool) -> DynamicTool {
@@ -200,8 +211,13 @@ impl ManagedToolSink for FilteredToolSink {
     }
 }
 
+/// Every tool is denied unless it is named, or unless the allowlist is exactly `["*"]`.
+/// A missing `allowed_tools` therefore registers nothing: exposure is a decision written in
+/// the config, never the absence of a field.
+const ALLOW_ALL: &str = "*";
+
 fn tool_allowed(allowlist: Option<&HashSet<String>>, name: &str) -> bool {
-    allowlist.is_none_or(|allowed| allowed.contains(name))
+    allowlist.is_some_and(|allowed| allowed.contains(ALLOW_ALL) || allowed.contains(name))
 }
 
 fn read_mcp_token(variable: &str) -> Result<String> {
@@ -234,8 +250,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_all_tools_when_no_allowlist_is_configured() {
-        assert!(tool_allowed(None, "anything"));
+    fn denies_every_tool_when_no_allowlist_is_configured() {
+        assert!(!tool_allowed(None, "anything"));
+    }
+
+    #[test]
+    fn wildcard_allowlist_is_the_only_way_to_grant_every_tool() {
+        let all = HashSet::from([ALLOW_ALL.to_string()]);
+        assert!(tool_allowed(Some(&all), "anything"));
+        assert!(tool_allowed(Some(&all), "delete"));
     }
 
     #[test]
@@ -256,6 +279,47 @@ mod tests {
     #[test]
     fn mcp_transport_rejects_empty_token() {
         assert!(mcp_transport_config("http://localhost/mcp".into(), Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn filtered_sink_registers_nothing_when_no_allowlist_is_configured() {
+        let handle = rig::tool::server::ToolServer::new().run();
+        let sink = FilteredToolSink {
+            inner: handle.clone(),
+            allowlist: None,
+            agent: "test".to_string(),
+        };
+        sink.add_managed_tools(vec![DynamicTool::new(
+            rig::message::ToolName::new("search").expect("valid tool name"),
+            "test tool",
+            serde_json::json!({"type": "object"}),
+            |_| Box::pin(async { Ok(rig::tool::ToolOutput::text("ok")) }),
+        )]);
+
+        assert!(!handle.snapshot().contains("search"));
+    }
+
+    #[test]
+    fn filtered_sink_registers_every_tool_for_the_wildcard() {
+        let handle = rig::tool::server::ToolServer::new().run();
+        let sink = FilteredToolSink {
+            inner: handle.clone(),
+            allowlist: Some(HashSet::from([ALLOW_ALL.to_string()])),
+            agent: "test".to_string(),
+        };
+        let tool = |name: &'static str| {
+            DynamicTool::new(
+                rig::message::ToolName::new(name).expect("valid tool name"),
+                "test tool",
+                serde_json::json!({"type": "object"}),
+                |_| Box::pin(async { Ok(rig::tool::ToolOutput::text("ok")) }),
+            )
+        };
+        sink.add_managed_tools(vec![tool("search"), tool("delete")]);
+
+        let catalog = handle.snapshot();
+        assert!(catalog.contains("search"));
+        assert!(catalog.contains("delete"));
     }
 
     #[test]

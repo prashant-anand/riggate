@@ -59,6 +59,22 @@ endpoint, registers its tools with Rig, and holds the connection for the agent's
 `max_turns` bounds the model calls made by a request, including tool follow-ups. This makes
 tools configurable without compiling tool implementations into the server binary.
 
+## Tools are denied unless named
+
+`allowed_tools` is an allowlist with a deny-by-default posture. An omitted field registers no
+tools. `[]` is the same. `["*"]` is the only way to grant everything. Mixing `*` with names is
+rejected, because it hides which decision was actually made.
+
+Rejected: granting every discovered tool when the field is absent. That reads as convenient and
+is the exact thing a security review looks for — a capability granted by omission. The gateway
+fails closed everywhere else (loopback bind, API key required off loopback, unknown fields
+rejected when strict), and a third-party MCP server adding a tool should not silently widen
+what an agent can do.
+
+The cost is discoverability, so every tool decision is logged with the agent, the tool name and
+the verdict. The operator starts denied, reads the log for the real names, then names what the
+agent may use.
+
 For non-streaming requests, failures use HTTP status codes rather than returning `200` with
 an error string inside, which would be untestable by monitoring.
 
