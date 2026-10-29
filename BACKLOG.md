@@ -2,6 +2,10 @@
 
 Candidate improvements for Riggate. This list captures ideas for discussion and prioritization; inclusion does not imply a release commitment.
 
+## Verified, and how
+
+- [x] **Model-driven tool invocation, end to end.** A real local model (`qwen2.5:7b` via Ollama) drove a permitted tool on a real `mcp-server-time` MCP server through `/v1/chat/completions`, and the same boot refused a second, non-allowlisted tool and logged both decisions. Recorded run, reproduction and the exact log lines: `docs/real-model-e2e.md`. Not in CI — it needs a live model and a live MCP server, so it is a manual check; the deterministic halves are in `agent::tests`.
+
 ## Monitoring and operations
 
 - [ ] Add per-target health checks for configured agents, including reachability, last success, latency, and recent errors.
