@@ -18,6 +18,10 @@ fn default_request_timeout_seconds() -> u64 {
     120
 }
 
+fn default_shutdown_grace_seconds() -> u64 {
+    10
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     /// Address to bind. Defaults to loopback — you opt in to exposure.
@@ -31,6 +35,11 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// How long open requests may finish after SIGINT/SIGTERM before the process exits.
+    /// A stream can be mid-answer, so a shutdown that never waits loses work; a shutdown that
+    /// waits forever is a SIGKILL from the service manager.
+    #[serde(default = "default_shutdown_grace_seconds")]
+    pub shutdown_grace_seconds: u64,
     #[serde(default)]
     pub strict_requests: bool,
 }
@@ -99,6 +108,9 @@ impl Config {
         }
         if cfg.request_timeout_seconds == 0 {
             bail!("request_timeout_seconds must be greater than zero");
+        }
+        if cfg.shutdown_grace_seconds == 0 {
+            bail!("shutdown_grace_seconds must be greater than zero");
         }
         for a in &cfg.agents {
             if a.name.trim().is_empty() {

@@ -18,6 +18,9 @@ max_request_bytes = 1048576
 max_concurrent_requests = 64
 # Upstream request deadline in seconds. Must be > 0. Default: 120.
 request_timeout_seconds = 120
+# Seconds open requests may finish after SIGINT/SIGTERM before the process exits. Must be > 0.
+# Default: 10. A stream can be mid-answer, so this is what a restart is allowed to wait for.
+shutdown_grace_seconds = 10
 # Ignore unknown chat request fields by default; set true to reject them with HTTP 400.
 strict_requests = false
 

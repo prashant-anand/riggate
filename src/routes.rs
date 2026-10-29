@@ -1,6 +1,6 @@
 use axum::{
     extract::{rejection::JsonRejection, Extension, Json, State},
-    http::{header, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::sse::{Event, Sse},
     response::IntoResponse,
     routing::{get, post},
@@ -14,6 +14,7 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{collections::HashMap, convert::Infallible};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -55,17 +56,80 @@ struct AppState {
     started_at: u64,
 }
 
+/// How a streaming response actually ended. Once the first token is sent the HTTP status is
+/// already 200, so the status alone cannot say whether the stream finished, failed upstream,
+/// timed out, or was abandoned by the client — which is the difference an operator cares about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Open,
+    Completed,
+    UpstreamError,
+    TimedOut,
+}
+
+impl StreamOutcome {
+    fn as_u8(self) -> u8 {
+        match self {
+            StreamOutcome::Open => 0,
+            StreamOutcome::Completed => 1,
+            StreamOutcome::UpstreamError => 2,
+            StreamOutcome::TimedOut => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => StreamOutcome::Completed,
+            2 => StreamOutcome::UpstreamError,
+            3 => StreamOutcome::TimedOut,
+            _ => StreamOutcome::Open,
+        }
+    }
+
+    /// `Open` at drop time means nothing terminal was ever recorded, so the client went away
+    /// mid-stream. 499 is the conventional status for that.
+    fn label(self) -> &'static str {
+        match self {
+            StreamOutcome::Open => "client_closed",
+            StreamOutcome::Completed => "completed",
+            StreamOutcome::UpstreamError => "upstream_error",
+            StreamOutcome::TimedOut => "timed_out",
+        }
+    }
+}
+
 struct RequestCompletionGuard {
     span: tracing::Span,
     started: tokio::time::Instant,
+    outcome: Arc<AtomicU8>,
+}
+
+impl RequestCompletionGuard {
+    fn new(span: tracing::Span, started: tokio::time::Instant) -> (Self, Arc<AtomicU8>) {
+        let outcome = Arc::new(AtomicU8::new(StreamOutcome::Open.as_u8()));
+        (
+            Self {
+                span,
+                started,
+                outcome: Arc::clone(&outcome),
+            },
+            outcome,
+        )
+    }
 }
 
 impl Drop for RequestCompletionGuard {
     fn drop(&mut self) {
+        let outcome = StreamOutcome::from_u8(self.outcome.load(Ordering::Relaxed));
         self.span.record("status", StatusCode::OK.as_u16());
+        self.span.record("outcome", outcome.label());
         self.span
             .record("duration_ms", self.started.elapsed().as_millis() as u64);
-        tracing::info!(parent: &self.span, "chat request completed");
+        if outcome == StreamOutcome::Completed {
+            tracing::info!(parent: &self.span, "chat request completed");
+        } else {
+            tracing::warn!(parent: &self.span, "chat request ended without a final response");
+        }
     }
 }
 
@@ -228,27 +292,50 @@ async fn chat(
     request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let request_id = completion_id();
-    let span = tracing::info_span!("chat.request", request_id = %request_id, agent = tracing::field::Empty, status = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
+    let span = tracing::info_span!("chat.request", request_id = %request_id, agent = tracing::field::Empty, status = tracing::field::Empty, outcome = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
     let started = tokio::time::Instant::now();
-    let result = chat_inner(State(state), Extension(control), request, started)
-        .instrument(span.clone())
-        .await;
-    let status = result
-        .as_ref()
-        .map(|response| response.status())
-        .unwrap_or_else(|(status, _)| *status);
-    let is_stream = result
-        .as_ref()
-        .ok()
-        .and_then(|response| response.headers().get(header::CONTENT_TYPE))
+    let result = chat_inner(
+        State(state),
+        Extension(control),
+        request,
+        started,
+        request_id.clone(),
+    )
+    .instrument(span.clone())
+    .await;
+
+    let mut response = match result {
+        Ok(response) => response,
+        Err((status, body)) => (status, body).into_response(),
+    };
+    // The id in the body, the id in the log line and the id on the wire are the same string, so
+    // a client can quote one value and an operator can find the request it belongs to.
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+
+    let status = response.status();
+    let is_stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"));
     if !is_stream {
         span.record("status", status.as_u16());
+        span.record(
+            "outcome",
+            if status.is_success() {
+                "completed"
+            } else {
+                "rejected"
+            },
+        );
         span.record("duration_ms", started.elapsed().as_millis() as u64);
         tracing::info!(parent: &span, "chat request completed");
     }
-    result
+    Ok(response)
 }
 
 async fn chat_inner(
@@ -256,6 +343,7 @@ async fn chat_inner(
     Extension(control): Extension<RequestControl>,
     request: Result<Json<ChatRequest>, JsonRejection>,
     started: tokio::time::Instant,
+    request_id: String,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let Json(req) = request.map_err(|rejection| {
         let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -314,16 +402,13 @@ async fn chat_inner(
     }
 
     if req.stream {
-        let id = completion_id();
+        let id = request_id;
         let model = req.model.clone();
         let max_tokens = req.max_tokens.or(req.max_completion_tokens);
         let run = runner.stream();
         let timeout = control.timeout;
         let span = tracing::Span::current();
-        let completion_guard = RequestCompletionGuard {
-            span: span.clone(),
-            started,
-        };
+        let (completion_guard, outcome) = RequestCompletionGuard::new(span.clone(), started);
         // A per-item timeout alone lets a slow drip hold the permit forever, so
         // the same Instant bounds the whole stream as well.
         let deadline = tokio::time::Instant::now() + timeout;
@@ -344,14 +429,18 @@ async fn chat_inner(
                 let id = id.clone();
                 let model = model.clone();
                 let span = span.clone();
+                let outcome = Arc::clone(&outcome);
                 async move {
                     let chunk = match item {
-                        Err(_) => json!({
-                            "error": {
-                                "message": "upstream request timed out",
-                                "type": "timeout_error"
-                            }
-                        }),
+                        Err(_) => {
+                            outcome.store(StreamOutcome::TimedOut.as_u8(), Ordering::Relaxed);
+                            json!({
+                                "error": {
+                                    "message": "upstream request timed out",
+                                    "type": "timeout_error"
+                                }
+                            })
+                        }
                         Ok(Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(
                             StreamEvent::Text { text, .. },
                         )))) => json!({
@@ -361,6 +450,7 @@ async fn chat_inner(
                             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
                         }),
                         Ok(Ok(MultiTurnStreamItem::FinalResponse(res))) => {
+                            outcome.store(StreamOutcome::Completed.as_u8(), Ordering::Relaxed);
                             span.record("prompt_tokens", res.usage.input_tokens);
                             span.record("completion_tokens", res.usage.output_tokens);
                             let finish_reason = completion_finish_reason(
@@ -377,12 +467,15 @@ async fn chat_inner(
                                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
                             })
                         }
-                        Ok(Err(error)) => json!({
-                            "error": {
-                                "message": format!("upstream error: {error}"),
-                                "type": "riggate_error"
-                            }
-                        }),
+                        Ok(Err(error)) => {
+                            outcome.store(StreamOutcome::UpstreamError.as_u8(), Ordering::Relaxed);
+                            json!({
+                                "error": {
+                                    "message": format!("upstream error: {error}"),
+                                    "type": "riggate_error"
+                                }
+                            })
+                        }
                         Ok(Ok(_)) => return None,
                     };
                     Some(Ok::<Event, Infallible>(Event::default().data(chunk.to_string())))
@@ -407,7 +500,7 @@ async fn chat_inner(
             tracing::Span::current().record("prompt_tokens", res.usage.input_tokens);
             tracing::Span::current().record("completion_tokens", res.usage.output_tokens);
             Ok(Json(json!(ChatResponse {
-                id: completion_id(),
+                id: request_id,
                 object: "chat.completion",
                 model: req.model.clone(),
                 choices: vec![ChatChoice {
@@ -496,17 +589,37 @@ fn validate_chat_request(
     Ok(())
 }
 
+/// The finish reason an OpenAI client understands. A provider-reported reason wins outright:
+/// reconstructing it from token counts mislabels providers that include reasoning tokens in
+/// `output_tokens`, or answers that land on the cap by coincidence. Token counts are only used
+/// when the provider said nothing at all, and only when they land exactly on a cap we set.
 fn completion_finish_reason(
     reported: Option<FinishReason>,
     output_tokens: Option<u64>,
     max_tokens: Option<u64>,
 ) -> &'static str {
-    if matches!(reported, Some(FinishReason::Length))
-        || max_tokens.is_some_and(|limit| output_tokens.is_some_and(|used| used >= limit))
-    {
-        "length"
-    } else {
-        "stop"
+    match reported {
+        Some(FinishReason::Length) => "length",
+        Some(FinishReason::ToolCalls) => "tool_calls",
+        Some(FinishReason::ContentFilter) => "content_filter",
+        Some(FinishReason::Stop) => "stop",
+        Some(FinishReason::Other(reason)) => {
+            // Outside the normalised vocabulary. Answer with a plain stop so clients that match on
+            // known values keep working, and keep the provider's spelling for the log.
+            tracing::debug!(provider_finish_reason = %reason, "unmapped provider finish reason");
+            "stop"
+        }
+        _ => match (max_tokens, output_tokens) {
+            (Some(limit), Some(used)) if used == limit => {
+                tracing::debug!(
+                    used,
+                    limit,
+                    "provider reported no finish reason; reporting length from an exactly reached cap"
+                );
+                "length"
+            }
+            _ => "stop",
+        },
     }
 }
 
@@ -563,6 +676,42 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    #[test]
+    fn a_reported_finish_reason_wins_over_the_token_count() {
+        // The provider said it stopped naturally, and the answer happens to land on the cap.
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::Stop), Some(64), Some(64)),
+            "stop"
+        );
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::Length), Some(64), Some(64)),
+            "length"
+        );
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::ToolCalls), None, None),
+            "tool_calls"
+        );
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::ContentFilter), None, None),
+            "content_filter"
+        );
+        assert_eq!(
+            completion_finish_reason(Some(FinishReason::Other("eos".into())), None, None),
+            "stop"
+        );
+    }
+
+    #[test]
+    fn the_cap_is_only_evidence_when_nothing_was_reported() {
+        assert_eq!(completion_finish_reason(None, Some(64), Some(64)), "length");
+        assert_eq!(completion_finish_reason(None, Some(63), Some(64)), "stop");
+        // Over the cap is not a truncation signal we invented; it is a provider counting
+        // differently, and guessing "length" there would be wrong.
+        assert_eq!(completion_finish_reason(None, Some(70), Some(64)), "stop");
+        assert_eq!(completion_finish_reason(None, Some(10), None), "stop");
+        assert_eq!(completion_finish_reason(None, None, None), "stop");
+    }
 
     fn message(role: &str, content: &str) -> Message {
         Message {
@@ -808,6 +957,13 @@ mod tests {
             .await
             .unwrap();
         let status = response.status();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .expect("every response carries an x-request-id")
+            .to_str()
+            .unwrap()
+            .to_string();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -817,8 +973,16 @@ mod tests {
             completion["choices"][0]["message"]["content"],
             "mock answer"
         );
-        assert_eq!(completion["choices"][0]["finish_reason"], "length");
+        assert_eq!(
+            completion["choices"][0]["finish_reason"], "stop",
+            "the upstream reported a natural stop; a token count that happens to equal \
+             max_tokens must not relabel it as truncation"
+        );
         assert_eq!(completion["model"], "mock");
+        assert_eq!(
+            completion["id"], request_id,
+            "the body id and the header must be the same value an operator can grep"
+        );
         let upstream = received_request.lock().unwrap().clone().unwrap();
         assert_eq!(upstream["temperature"], 0.3);
         assert_eq!(upstream["max_tokens"], 42);

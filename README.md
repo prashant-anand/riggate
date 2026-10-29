@@ -87,6 +87,15 @@ other non-text parts are not supported. Errors use HTTP status codes: unknown mo
 requests rejected at the concurrency limit return `503`. Upstream timeouts return `504`; if a
 stream has started, errors are sent in an SSE event.
 
+Every response carries an `X-Request-Id` header, and it is the same value as the `id` in the
+body and the `request_id` in the log line for that request. Quote it when reporting a problem
+and the log line can be found without a time range.
+
+`finish_reason` is whatever the provider reported. When a provider reports nothing, `stop` is
+returned unless the answer landed exactly on a `max_tokens` limit you set, which is reported as
+`length`. Token counts are not used to overrule a reported reason, so an answer that happens to
+reach the cap is not labelled truncated.
+
 Riggate serves plaintext HTTP and does not terminate TLS. For remote access, put it behind a
 TLS-enabled ingress or reverse proxy; do not expose the plaintext listener directly to an
 untrusted network.
@@ -98,6 +107,7 @@ bind = "127.0.0.1:8080"
 max_request_bytes = 1048576
 max_concurrent_requests = 64
 request_timeout_seconds = 120
+shutdown_grace_seconds = 10
 strict_requests = false
 
 [[agents]]
@@ -117,11 +127,21 @@ The top-level request controls default to a 1 MiB body limit, 64 concurrent agen
 120-second upstream timeout. Unknown request fields are ignored by default; set
 `strict_requests = true` to restore rejection of unknown fields.
 
+On `SIGINT` or `SIGTERM` the listener stops accepting new requests and open ones get up to
+`shutdown_grace_seconds` (default 10) to finish, so a stream mid-answer is not cut off by a
+restart. If requests are still open when the grace period ends, the process exits and logs a
+warning naming the period it waited.
+
+Each request logs one line with `request_id`, `agent`, `status`, `outcome`, `duration_ms` and
+token counts. `outcome` is `completed`, `rejected`, `upstream_error`, `timed_out` or
+`client_closed`; the last three are the failure modes a bare `status` hides, because a stream
+that broke after its first token was already sent as `200`.
+
 MCP tools are denied unless they are named. Omitting `allowed_tools`, or setting `[]`,
 registers no tools from that server. Set `allowed_tools = ["*"]` to register every discovered
-tool. Every decision is logged at startup with the agent, the tool name, and whether it was
-allowed, so the log is how you find the names to allow. The policy is applied again when the
-server refreshes its tool list.
+tool. Every decision is logged at startup with the agent, the MCP server URL, the tool name, and
+whether it was allowed, so the log is how you find the names to allow. The policy is applied
+again when the server refreshes its tool list.
 
 Set `bearer_token_env` to the name of an environment variable containing the MCP server's
 bearer token. Riggate reads the value when it starts and does not store credentials in the TOML

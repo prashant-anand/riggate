@@ -100,16 +100,61 @@ async fn serve(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("binding {}", cfg.bind))?;
     info!(bind = %cfg.bind, agents = cfg.agents.len(), "riggate listening");
 
-    axum::serve(
+    // A request can be mid-stream when the signal arrives, so stop accepting and let it finish.
+    // The grace period exists because the alternative to waiting forever is the service
+    // manager's SIGKILL, which loses the same work with less explanation.
+    let grace = std::time::Duration::from_secs(cfg.shutdown_grace_seconds);
+    let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown().await;
+        let _ = signal_tx.send(true);
+    });
+
+    let mut serve_rx = signal_rx.clone();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
-    .await?;
+    .with_graceful_shutdown(async move {
+        let _ = serve_rx.wait_for(|fired| *fired).await;
+    });
+
+    let mut drain_rx = signal_rx;
+    let drain = async move {
+        let _ = drain_rx.wait_for(|fired| *fired).await;
+        tokio::time::sleep(grace).await;
+    };
+
+    tokio::select! {
+        result = server => result?,
+        _ = drain => {
+            tracing::warn!(
+                grace_seconds = grace.as_secs(),
+                "shutdown grace period elapsed with requests still open; exiting"
+            );
+        }
+    }
     Ok(())
 }
 
 async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
+    wait_for_signal().await;
     info!("shutting down");
+}
+
+/// SIGINT from a terminal, SIGTERM from systemd, Docker or a process supervisor. Handling only
+/// the first means the second kills the process mid-stream with no drain at all.
+#[cfg(unix)]
+async fn wait_for_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }

@@ -123,6 +123,7 @@ async fn connect_mcp(
         inner: tool_server.clone(),
         allowlist,
         agent: agent.to_string(),
+        server: server.url.clone(),
     };
     let handler = McpClientHandler::new(client_info, sink);
     let token = server
@@ -143,6 +144,9 @@ struct FilteredToolSink {
     inner: ToolServerHandle,
     allowlist: Option<HashSet<String>>,
     agent: String,
+    /// Which MCP server these tools came from. The allowlist is per server, so a log line
+    /// without it cannot be reconciled against the config it was written from.
+    server: String,
 }
 
 impl FilteredToolSink {
@@ -153,7 +157,7 @@ impl FilteredToolSink {
             .filter_map(|tool| {
                 let name = tool.name();
                 let is_allowed = tool_allowed(self.allowlist.as_ref(), name.as_ref());
-                tracing::info!(agent = %self.agent, tool = %name, allowed = is_allowed, "MCP tool policy evaluated");
+                tracing::info!(agent = %self.agent, server = %self.server, tool = %name, allowed = is_allowed, "MCP tool policy evaluated");
                 is_allowed.then(|| self.instrument_tool(tool))
             })
             .collect();
@@ -162,6 +166,7 @@ impl FilteredToolSink {
         if self.allowlist.is_none() && discovered > 0 {
             tracing::warn!(
                 agent = %self.agent,
+                server = %self.server,
                 discovered,
                 "MCP server offers tools but allowed_tools is not set; none are registered. Name them explicitly, or set allowed_tools = [\"*\"]"
             );
@@ -173,6 +178,7 @@ impl FilteredToolSink {
         let definition = tool.definition();
         let tool_name = definition.name.to_string();
         let agent = self.agent.clone();
+        let server = self.server.clone();
         let source = tool.clone();
         let live_source = tool;
         DynamicTool::new(
@@ -182,11 +188,12 @@ impl FilteredToolSink {
             move |arguments| {
                 let source = source.clone();
                 let agent = agent.clone();
+                let server = server.clone();
                 let tool_name = tool_name.clone();
                 Box::pin(async move {
-                    tracing::info!(agent = %agent, tool = %tool_name, allowed = true, "MCP tool invocation started");
+                    tracing::info!(agent = %agent, server = %server, tool = %tool_name, "MCP tool invocation started");
                     let result = source.run(arguments).await;
-                    tracing::info!(agent = %agent, tool = %tool_name, succeeded = result.is_ok(), "MCP tool invocation finished");
+                    tracing::info!(agent = %agent, server = %server, tool = %tool_name, succeeded = result.is_ok(), "MCP tool invocation finished");
                     result
                 })
             },
@@ -288,6 +295,7 @@ mod tests {
             inner: handle.clone(),
             allowlist: None,
             agent: "test".to_string(),
+            server: "http://127.0.0.1:9/mcp".to_string(),
         };
         sink.add_managed_tools(vec![DynamicTool::new(
             rig::message::ToolName::new("search").expect("valid tool name"),
@@ -306,6 +314,7 @@ mod tests {
             inner: handle.clone(),
             allowlist: Some(HashSet::from([ALLOW_ALL.to_string()])),
             agent: "test".to_string(),
+            server: "http://127.0.0.1:9/mcp".to_string(),
         };
         let tool = |name: &'static str| {
             DynamicTool::new(
@@ -329,6 +338,7 @@ mod tests {
             inner: handle.clone(),
             allowlist: Some(HashSet::from(["search".to_string()])),
             agent: "test".to_string(),
+            server: "http://127.0.0.1:9/mcp".to_string(),
         };
         let tool = |name: &'static str| {
             DynamicTool::new(

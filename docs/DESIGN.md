@@ -84,6 +84,24 @@ Every agent is constructed during startup and stored in an `Arc<HashMap<..>>`. R
 borrow them. This keeps request latency free of client construction and, more importantly,
 fails fast: a missing key is a crash at boot with a clear message, not a 500 under load.
 
+## A stream's status is not its outcome
+
+Once the first token is written the response status is `200` and cannot change. A log that
+records only the status cannot distinguish a stream that finished from one that failed upstream,
+timed out, or was abandoned by the client — in the very line an operator would use to show
+nothing failed. So the guard records `outcome` beside `status`: `completed`, `client_closed`,
+`upstream_error` or `timed_out`, and logs at `WARN` for everything but the first.
+
+The same reasoning puts the request id on the wire as `X-Request-Id`, equal to the `id` in the
+body and the `request_id` in the log line. An identity that exists only inside the server turns
+every support question into a time-range search.
+
+Shutdown is the same problem in the other direction. `SIGTERM` is what a service manager sends,
+so handling only `SIGINT` means every restart kills streams mid-answer. The listener stops
+accepting, open requests get `shutdown_grace_seconds`, and the process exits with a warning if
+they outlive it. Waiting forever is not the alternative to ignoring the signal: it is a
+`SIGKILL` with less explanation.
+
 ## What Rig gives us
 
 `rig` supplies the provider clients, the agent loop, typed generation options, and the
