@@ -22,6 +22,10 @@ fn default_shutdown_grace_seconds() -> u64 {
     10
 }
 
+fn default_log_targets() -> Vec<LogTarget> {
+    vec![LogTarget::Stderr]
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     /// Address to bind. Defaults to loopback — you opt in to exposure.
@@ -42,6 +46,16 @@ pub struct Config {
     pub shutdown_grace_seconds: u64,
     #[serde(default)]
     pub strict_requests: bool,
+    #[serde(default = "default_log_targets")]
+    pub log_targets: Vec<LogTarget>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogTarget {
+    Stdout,
+    Stderr,
+    Otlp,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -111,6 +125,17 @@ impl Config {
         }
         if cfg.shutdown_grace_seconds == 0 {
             bail!("shutdown_grace_seconds must be greater than zero");
+        }
+        if cfg.log_targets.is_empty() {
+            bail!("log_targets must contain at least one target");
+        }
+        if cfg
+            .log_targets
+            .iter()
+            .enumerate()
+            .any(|(i, target)| cfg.log_targets[..i].contains(target))
+        {
+            bail!("log_targets contains a duplicate target");
         }
         for a in &cfg.agents {
             if a.name.trim().is_empty() {
@@ -243,7 +268,33 @@ preamble = "Be brief."
         assert_eq!(cfg.max_request_bytes, 1_048_576);
         assert_eq!(cfg.max_concurrent_requests, 64);
         assert_eq!(cfg.request_timeout_seconds, 120);
+        assert_eq!(cfg.log_targets, vec![LogTarget::Stderr]);
         assert!(!cfg.strict_requests);
+    }
+
+    #[test]
+    fn parses_multiple_log_targets() {
+        let raw = "log_targets = [\"stdout\", \"otlp\"]\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        let cfg = Config::parse(raw).expect("logging targets should parse");
+        assert_eq!(cfg.log_targets, vec![LogTarget::Stdout, LogTarget::Otlp]);
+    }
+
+    #[test]
+    fn rejects_empty_log_targets() {
+        let raw = "log_targets = []\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("log_targets"));
+    }
+
+    #[test]
+    fn rejects_duplicate_log_targets() {
+        let raw = "log_targets = [\"stderr\", \"stderr\"]\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        assert!(Config::parse(raw)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate target"));
     }
 
     #[test]

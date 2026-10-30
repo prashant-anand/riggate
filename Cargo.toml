@@ -1,6 +1,6 @@
 [package]
 name = "riggate"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A single-binary agent server for air-gapped networks. Bring your own model."
 license = "MIT"
@@ -17,6 +17,10 @@ panic = "abort"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["logs"] }
+opentelemetry-appender-tracing = { version = "0.33.1", features = ["experimental_span_attributes"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["logs"] }
 futures-util = "0.3"
 rig = { version = "0.45", features = ["rmcp"] }
 rig-core = { version = "0.45", default-features = false }
@@ -28,8 +32,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-stream = { version = "0.1", features = ["time"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["limit"] }
+url = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

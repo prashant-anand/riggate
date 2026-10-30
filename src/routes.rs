@@ -163,11 +163,20 @@ pub fn router(agents: Registry, api_key: Option<String>, limits: RequestLimits) 
         .layer(RequestBodyLimitLayer::new(limits.max_request_bytes))
         .route_layer(axum::middleware::from_fn_with_state(api_key, authorize));
 
-    Router::new().route("/healthz", get(health)).merge(api)
+    Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
+        .merge(api)
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Readiness is only exposed after configuration, providers, and MCP connections have been
+/// initialized. It does not make live requests to providers; use `/healthz` for liveness.
+async fn readiness() -> Json<Value> {
+    Json(json!({"status": "ready"}))
 }
 
 /// Advertises configured agents in the OpenAI `/v1/models` shape, so existing
@@ -913,6 +922,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+
+        let readiness = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::OK);
+        let readiness_body = axum::body::to_bytes(readiness.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let readiness_json: Value = serde_json::from_slice(&readiness_body).unwrap();
+        assert_eq!(readiness_json["status"], "ready");
 
         let unauthorized = app
             .clone()

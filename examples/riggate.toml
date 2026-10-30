@@ -24,6 +24,13 @@ shutdown_grace_seconds = 10
 # Ignore unknown chat request fields by default; set true to reject them with HTTP 400.
 strict_requests = false
 
+# Emit structured JSON logs to selected streams and/or an OTLP collector. Allowed values:
+# "stdout", "stderr", "otlp". The default is ["stderr"]. OTLP uses standard
+# OTEL_EXPORTER_OTLP_* environment variables and batches logs in memory.
+log_targets = ["stderr"]
+# Example: log_targets = ["stderr", "otlp"]
+# Then export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://collector:4318/v1/logs
+
 # A local model. Clients select it with model = "local".
 # Provider is "openai" or "ollama"; this model must already be available in Ollama.
 [[agents]]

@@ -77,6 +77,7 @@ default; set `strict_requests = true` to reject them. Invalid option values retu
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/healthz` | Liveness check; does not require authentication |
+| `GET` | `/readyz` | Startup readiness; does not require authentication |
 | `GET` | `/v1/models` | Lists configured agents |
 | `POST` | `/v1/chat/completions` | Runs an agent |
 
@@ -137,6 +138,23 @@ token counts. `outcome` is `completed`, `rejected`, `upstream_error`, `timed_out
 `client_closed`; the last three are the failure modes a bare `status` hides, because a stream
 that broke after its first token was already sent as `200`.
 
+Logs are JSON lines. Set the top-level `log_targets` list to any combination of `"stdout"`,
+`"stderr"`, and `"otlp"`; the default is `["stderr"]`. Each selected target receives the same
+filtered events. `RUST_LOG` controls filtering (default: `riggate=info`).
+
+To export through OTLP/HTTP, include `"otlp"` and set `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (or
+the general `OTEL_EXPORTER_OTLP_ENDPOINT`). Optional authentication headers use
+`OTEL_EXPORTER_OTLP_LOGS_HEADERS` or `OTEL_EXPORTER_OTLP_HEADERS`, in the OpenTelemetry format
+`key=value,key2=value2`. Riggate checks TCP connectivity to the collector at startup, waiting up
+to three seconds. A failed check is reported to stderr and does not prevent the API from starting.
+This check does not validate TLS, credentials, or whether the endpoint accepts OTLP logs.
+Exported logs are batched in a bounded in-memory queue; configure it with the OpenTelemetry SDK
+variables `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, and
+`OTEL_BLRP_SCHEDULE_DELAY` when needed. Failed exports are retried. On graceful shutdown, Riggate
+waits up to `shutdown_grace_seconds` for the OTLP batch to flush after request draining; records
+can still be lost if the queue fills or the process is killed before shutdown completes. Select
+`stderr` alongside `otlp` to retain the local log stream as a fallback.
+
 MCP tools are denied unless they are named. Omitting `allowed_tools`, or setting `[]`,
 registers no tools from that server. Set `allowed_tools = ["*"]` to register every discovered
 tool. Every decision is logged at startup with the agent, the MCP server URL, the tool name, and
@@ -154,6 +172,11 @@ file.
 | `OPENAI_BASE_URL` | OpenAI-compatible endpoint, such as Azure OpenAI or vLLM |
 | `OLLAMA_API_BASE_URL` | Ollama endpoint; defaults to `http://localhost:11434` |
 | MCP token variable | The variable named by an MCP server's `bearer_token_env` |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | OTLP log endpoint, when `"otlp"` is in `log_targets` |
+| `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | OTLP log authentication or routing headers |
+| `OTEL_BLRP_MAX_QUEUE_SIZE` | Maximum in-memory OTLP log queue size |
+| `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE` | Maximum OTLP logs per export batch |
+| `OTEL_BLRP_SCHEDULE_DELAY` | OTLP log batch export interval in milliseconds |
 
 MCP endpoints must be reachable from the Riggate host. Riggate currently supports Streamable
 HTTP transport; stdio transport is not implemented.
