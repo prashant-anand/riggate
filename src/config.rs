@@ -33,6 +33,8 @@ pub struct Config {
     pub bind: String,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
+    #[serde(default)]
+    pub clients: Vec<ClientConfig>,
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
     #[serde(default = "default_max_concurrent_requests")]
@@ -48,6 +50,16 @@ pub struct Config {
     pub strict_requests: bool,
     #[serde(default = "default_log_targets")]
     pub log_targets: Vec<LogTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClientConfig {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub token_env: String,
+    #[serde(default)]
+    pub allowed_agents: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -180,6 +192,31 @@ impl Config {
                 }
             }
         }
+        let agent_names: std::collections::HashSet<_> =
+            cfg.agents.iter().map(|agent| agent.name.as_str()).collect();
+        let mut client_ids = std::collections::HashSet::new();
+        let mut token_envs = std::collections::HashSet::new();
+        for client in &cfg.clients {
+            if client.id.trim().is_empty() {
+                bail!("a client has an empty id");
+            }
+            if !client_ids.insert(&client.id) {
+                bail!("duplicate client id '{}'", client.id);
+            }
+            if client.token_env.trim().is_empty() {
+                bail!("client '{}' has an empty token_env", client.id);
+            }
+            if !token_envs.insert(&client.token_env) {
+                bail!("duplicate client token_env '{}'", client.token_env);
+            }
+            if let Some(agents) = &client.allowed_agents {
+                for agent in agents {
+                    if !agent_names.contains(agent.as_str()) {
+                        bail!("client '{}' allows unknown agent '{}'", client.id, agent);
+                    }
+                }
+            }
+        }
         Ok(cfg)
     }
 }
@@ -210,6 +247,45 @@ preamble = "Be brief."
         assert_eq!(cfg.agents.len(), 2);
         assert_eq!(cfg.agents[1].provider, Provider::Ollama);
         assert_eq!(cfg.agents[1].preamble.as_deref(), Some("Be brief."));
+    }
+
+    #[test]
+    fn parses_client_identity_and_agent_allowlist() {
+        let raw = format!(
+            "{GOOD}\n[[clients]]\nid=\"claims\"\nname=\"Claims App\"\ntoken_env=\"CLAIMS_TOKEN\"\nallowed_agents=[\"assistant\"]\n"
+        );
+        let cfg = Config::parse(&raw).expect("client config should parse");
+        assert_eq!(cfg.clients[0].id, "claims");
+        assert_eq!(cfg.clients[0].name.as_deref(), Some("Claims App"));
+        assert_eq!(
+            cfg.clients[0].allowed_agents.as_deref(),
+            Some(["assistant".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_client_ids_and_token_environment_names() {
+        let duplicate_id = format!("{GOOD}\n[[clients]]\nid=\"a\"\ntoken_env=\"TOKEN_A\"\n[[clients]]\nid=\"a\"\ntoken_env=\"TOKEN_B\"\n");
+        assert!(Config::parse(&duplicate_id)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate client id"));
+        let duplicate_env = format!("{GOOD}\n[[clients]]\nid=\"a\"\ntoken_env=\"TOKEN\"\n[[clients]]\nid=\"b\"\ntoken_env=\"TOKEN\"\n");
+        assert!(Config::parse(&duplicate_env)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate client token_env"));
+    }
+
+    #[test]
+    fn rejects_unknown_client_agent_allowlist_entry() {
+        let raw = format!(
+            "{GOOD}\n[[clients]]\nid=\"a\"\ntoken_env=\"TOKEN\"\nallowed_agents=[\"missing\"]\n"
+        );
+        assert!(Config::parse(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown agent 'missing'"));
     }
 
     #[test]

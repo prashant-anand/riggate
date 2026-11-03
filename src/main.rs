@@ -134,13 +134,14 @@ async fn serve_initialized(cfg: config::Config) -> Result<()> {
     let api_key = std::env::var("RIGGATE_API_KEY")
         .ok()
         .filter(|key| !key.is_empty());
-    if auth::bind_requires_auth(&cfg.bind) && api_key.is_none() {
-        anyhow::bail!("RIGGATE_API_KEY is required when binding outside loopback");
+    let clients = auth::ClientRegistry::from_config(&cfg.clients, api_key)?;
+    if auth::bind_requires_auth(&cfg.bind) && !clients.has_credentials() {
+        anyhow::bail!("at least one configured client token or RIGGATE_API_KEY is required when binding outside loopback");
     }
     let registry = agent::build(&cfg.agents).await?;
-    let app = routes::router(
+    let app = routes::router_with_clients(
         registry,
-        api_key,
+        clients,
         routes::RequestLimits {
             max_request_bytes: cfg.max_request_bytes,
             max_concurrent_requests: cfg.max_concurrent_requests,
@@ -277,7 +278,15 @@ fn init_logging(targets: &[config::LogTarget]) -> Result<Option<SdkLoggerProvide
         let bridge = OpenTelemetryTracingBridge::builder(&provider)
             .with_tracing_span_attributes(TracingSpanAttributes::allowlist([
                 "request_id",
+                "client_id",
+                "client_name",
+                "on_behalf_of",
                 "agent",
+                "server",
+                "tool",
+                "decision",
+                "error_kind",
+                "args_sha256",
                 "status",
                 "outcome",
                 "duration_ms",

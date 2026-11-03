@@ -178,6 +178,29 @@ file.
 | `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE` | Maximum OTLP logs per export batch |
 | `OTEL_BLRP_SCHEDULE_DELAY` | OTLP log batch export interval in milliseconds |
 
+## Who did what
+
+For deployments with multiple callers, configure one token per client. Tokens are read from the
+named environment variables at startup. `allowed_agents` is optional; omitting it permits every
+configured agent. `RIGGATE_API_KEY` remains supported as the implicit `default` client.
+
+```toml
+[[clients]]
+id = "claims-app"
+name = "Claims application"
+token_env = "CLAIMS_APP_TOKEN"
+allowed_agents = ["assistant"]
+```
+
+Clients can identify the human user with the OpenAI-compatible top-level `user` field or the
+`X-Riggate-On-Behalf-Of` header. If neither is supplied, the request is attributed to
+`unattributed` and a warning is logged. Each MCP tool call emits a structured audit record; tool
+arguments are represented only by their SHA-256 hash. For example:
+
+```json
+{"request_id":"chatcmpl-abc123","client_id":"claims-app","client_name":"Claims application","on_behalf_of":"user-42","agent":"assistant","server":"http://mcp.internal/mcp","tool":"lookup_claim","decision":"allowed","outcome":"ok","error_kind":"","duration_ms":18,"args_sha256":"…","message":"MCP tool audit"}
+```
+
 MCP endpoints must be reachable from the Riggate host. Riggate currently supports Streamable
 HTTP transport; stdio transport is not implemented.
 
