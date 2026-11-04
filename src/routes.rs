@@ -143,6 +143,7 @@ impl Drop for RequestCompletionGuard {
     }
 }
 
+#[cfg(test)]
 pub fn router(agents: Registry, api_key: Option<String>, limits: RequestLimits) -> Router {
     let clients = ClientRegistry::from_config(&[], api_key).expect("legacy client registry");
     router_with_clients(agents, clients, limits)
@@ -319,6 +320,14 @@ struct ChatResponse {
     usage: UsageOut,
 }
 
+struct ChatRequestContext {
+    identity: ClientIdentity,
+    headers: HeaderMap,
+    started: tokio::time::Instant,
+    request_id: String,
+    outcome: Arc<AtomicU8>,
+}
+
 async fn chat(
     State(state): State<AppState>,
     Extension(control): Extension<RequestControl>,
@@ -330,18 +339,16 @@ async fn chat(
     let span = tracing::info_span!("chat.request", request_id = %request_id, client_id = %identity.id, client_name = %identity.name, agent = tracing::field::Empty, status = tracing::field::Empty, outcome = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
     let started = tokio::time::Instant::now();
     let outcome = Arc::new(AtomicU8::new(StreamOutcome::Open.as_u8()));
-    let result = chat_inner(
-        State(state),
-        Extension(control),
-        request,
+    let context = ChatRequestContext {
         identity,
         headers,
         started,
-        request_id.clone(),
-        Arc::clone(&outcome),
-    )
-    .instrument(span.clone())
-    .await;
+        request_id: request_id.clone(),
+        outcome: Arc::clone(&outcome),
+    };
+    let result = chat_inner(State(state), Extension(control), request, context)
+        .instrument(span.clone())
+        .await;
 
     let mut response = match result {
         Ok(response) => response,
@@ -385,12 +392,15 @@ async fn chat_inner(
     State(state): State<AppState>,
     Extension(control): Extension<RequestControl>,
     request: Result<Json<ChatRequest>, JsonRejection>,
-    identity: ClientIdentity,
-    headers: HeaderMap,
-    started: tokio::time::Instant,
-    request_id: String,
-    outcome: Arc<AtomicU8>,
+    context: ChatRequestContext,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let ChatRequestContext {
+        identity,
+        headers,
+        started,
+        request_id,
+        outcome,
+    } = context;
     let Json(req) = request.map_err(|rejection| {
         let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
             StatusCode::PAYLOAD_TOO_LARGE
