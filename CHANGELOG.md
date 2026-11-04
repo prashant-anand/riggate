@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 — Unreleased
+
+### Added
+
+- Per-client bearer tokens, optional agent access lists, and end-user attribution for MCP tool audit records.
+- Structured tool decision and invocation audit logs with canonical argument hashes; raw tool arguments are not logged.
+
 ## 0.3.0 — 2026-10-30
 
 ### Added

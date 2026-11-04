@@ -1,6 +1,6 @@
 use axum::{
     extract::{rejection::JsonRejection, Extension, Json, State},
-    http::{header, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::sse::{Event, Sse},
     response::IntoResponse,
     routing::{get, post},
@@ -22,7 +22,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing::Instrument;
 
 use crate::agent::Registry;
-use crate::auth::authorize;
+use crate::auth::{authorize, ClientIdentity, ClientRegistry};
 
 #[derive(Clone, Debug)]
 pub struct RequestLimits {
@@ -143,7 +143,17 @@ impl Drop for RequestCompletionGuard {
     }
 }
 
+#[cfg(test)]
 pub fn router(agents: Registry, api_key: Option<String>, limits: RequestLimits) -> Router {
+    let clients = ClientRegistry::from_config(&[], api_key).expect("legacy client registry");
+    router_with_clients(agents, clients, limits)
+}
+
+pub fn router_with_clients(
+    agents: Registry,
+    clients: ClientRegistry,
+    limits: RequestLimits,
+) -> Router {
     let control = RequestControl {
         semaphore: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
         timeout: limits.timeout,
@@ -161,7 +171,7 @@ pub fn router(agents: Registry, api_key: Option<String>, limits: RequestLimits) 
         })
         .layer(Extension(control))
         .layer(RequestBodyLimitLayer::new(limits.max_request_bytes))
-        .route_layer(axum::middleware::from_fn_with_state(api_key, authorize));
+        .route_layer(axum::middleware::from_fn_with_state(clients, authorize));
 
     Router::new()
         .route("/healthz", get(health))
@@ -181,10 +191,14 @@ async fn readiness() -> Json<Value> {
 
 /// Advertises configured agents in the OpenAI `/v1/models` shape, so existing
 /// OpenAI SDKs can discover them without custom code.
-async fn models(State(state): State<AppState>) -> Json<Value> {
+async fn models(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ClientIdentity>,
+) -> Json<Value> {
     let data: Vec<Value> = state
         .agents
         .keys()
+        .filter(|name| identity.allowed_agents.as_ref().is_none_or(|allowed| allowed.contains(*name)))
         .map(|name| json!({"id": name, "object": "model", "created": state.started_at, "owned_by": "riggate"}))
         .collect();
     Json(json!({"object": "list", "data": data}))
@@ -197,6 +211,7 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(default)]
     stream: bool,
+    user: Option<String>,
     temperature: Option<f64>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
@@ -305,25 +320,35 @@ struct ChatResponse {
     usage: UsageOut,
 }
 
+struct ChatRequestContext {
+    identity: ClientIdentity,
+    headers: HeaderMap,
+    started: tokio::time::Instant,
+    request_id: String,
+    outcome: Arc<AtomicU8>,
+}
+
 async fn chat(
     State(state): State<AppState>,
     Extension(control): Extension<RequestControl>,
+    Extension(identity): Extension<ClientIdentity>,
+    headers: HeaderMap,
     request: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let request_id = completion_id();
-    let span = tracing::info_span!("chat.request", request_id = %request_id, agent = tracing::field::Empty, status = tracing::field::Empty, outcome = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
+    let span = tracing::info_span!("chat.request", request_id = %request_id, client_id = %identity.id, client_name = %identity.name, agent = tracing::field::Empty, status = tracing::field::Empty, outcome = tracing::field::Empty, duration_ms = tracing::field::Empty, prompt_tokens = tracing::field::Empty, completion_tokens = tracing::field::Empty);
     let started = tokio::time::Instant::now();
     let outcome = Arc::new(AtomicU8::new(StreamOutcome::Open.as_u8()));
-    let result = chat_inner(
-        State(state),
-        Extension(control),
-        request,
+    let context = ChatRequestContext {
+        identity,
+        headers,
         started,
-        request_id.clone(),
-        Arc::clone(&outcome),
-    )
-    .instrument(span.clone())
-    .await;
+        request_id: request_id.clone(),
+        outcome: Arc::clone(&outcome),
+    };
+    let result = chat_inner(State(state), Extension(control), request, context)
+        .instrument(span.clone())
+        .await;
 
     let mut response = match result {
         Ok(response) => response,
@@ -367,10 +392,15 @@ async fn chat_inner(
     State(state): State<AppState>,
     Extension(control): Extension<RequestControl>,
     request: Result<Json<ChatRequest>, JsonRejection>,
-    started: tokio::time::Instant,
-    request_id: String,
-    outcome: Arc<AtomicU8>,
+    context: ChatRequestContext,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let ChatRequestContext {
+        identity,
+        headers,
+        started,
+        request_id,
+        outcome,
+    } = context;
     let Json(req) = request.map_err(|rejection| {
         let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
             StatusCode::PAYLOAD_TOO_LARGE
@@ -383,6 +413,39 @@ async fn chat_inner(
         )
     })?;
     tracing::Span::current().record("agent", req.model.as_str());
+    if identity
+        .allowed_agents
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(&req.model))
+    {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "client '{}' is not allowed to use agent '{}'",
+                identity.id, req.model
+            ),
+        ));
+    }
+    let on_behalf_of = req
+        .user
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            headers
+                .get("x-riggate-on-behalf-of")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or("unattributed");
+    if on_behalf_of == "unattributed" {
+        tracing::warn!(client_id = %identity.id, request_id = %request_id, "request has no end-user attribution");
+    }
+    let audit_context = crate::agent::AuditContext {
+        request_id: request_id.clone(),
+        client_id: identity.id.clone(),
+        client_name: identity.name.clone(),
+        on_behalf_of: on_behalf_of.to_string(),
+    };
     validate_chat_request(&req, control.strict_requests)?;
     let agent = state.agents.get(&req.model).ok_or_else(|| {
         err(
@@ -540,16 +603,25 @@ async fn chat_inner(
             )]))
             .boxed();
         let events = stream::unfold(
-            (events, permit, completion_guard),
-            |(mut events, permit, completion_guard)| async move {
-                let next = events.next().await?;
-                Some((next, (events, permit, completion_guard)))
+            (events, permit, completion_guard, audit_context.clone()),
+            |(mut events, permit, completion_guard, audit_context)| async move {
+                let next =
+                    crate::agent::with_audit_context(audit_context.clone(), events.next()).await?;
+                Some((next, (events, permit, completion_guard, audit_context)))
             },
         );
         return Ok(Sse::new(events).into_response());
     }
 
-    match tokio::time::timeout(control.timeout, runner).await {
+    match tokio::time::timeout(
+        control.timeout,
+        crate::agent::with_audit_context(
+            audit_context,
+            std::future::IntoFuture::into_future(runner),
+        ),
+    )
+    .await
+    {
         Ok(Ok(res)) => {
             tracing::Span::current().record("prompt_tokens", res.usage.input_tokens);
             tracing::Span::current().record("completion_tokens", res.usage.output_tokens);
@@ -955,6 +1027,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_with_restricted_allowed_agents_gets_403_for_another_agent() {
+        let identity = ClientIdentity {
+            id: "claims".into(),
+            name: "Claims app".into(),
+            allowed_agents: Some(Arc::new(std::collections::HashSet::from(["other".into()]))),
+        };
+        let clients = ClientRegistry::test_from_tokens(vec![("token".into(), identity)]);
+        let app = router_with_clients(
+            crate::agent::test_registry("http://127.0.0.1:1/v1"),
+            clients,
+            RequestLimits::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"mock","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn malformed_json_returns_an_openai_shaped_bad_request() {
         let registry = crate::agent::test_registry("http://127.0.0.1:1/v1");
         let app = router(registry, None, RequestLimits::default());
@@ -980,7 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completion_works_against_a_local_openai_compatible_server() {
+    async fn missing_on_behalf_of_is_attributed_to_unattributed_without_failing_the_request() {
         let received_request = Arc::new(std::sync::Mutex::new(None));
         let received = received_request.clone();
         let completion = post(move |Json(request): Json<Value>| {

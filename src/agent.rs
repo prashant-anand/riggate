@@ -3,10 +3,42 @@ use rig::prelude::*;
 use rig::providers::{ollama, openai};
 use rig::tool::{server::ToolServerHandle, DynamicTool};
 use rig_core::tool::managed::{ManagedToolSink, ManagedToolToken};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{AgentConfig, McpServerConfig, Provider};
+
+#[derive(Clone, Debug)]
+pub struct AuditContext {
+    pub request_id: String,
+    pub client_id: String,
+    pub client_name: String,
+    pub on_behalf_of: String,
+}
+
+impl Default for AuditContext {
+    fn default() -> Self {
+        Self {
+            request_id: "startup".into(),
+            client_id: "system".into(),
+            client_name: "system".into(),
+            on_behalf_of: "unattributed".into(),
+        }
+    }
+}
+
+tokio::task_local! {
+    static CURRENT_AUDIT_CONTEXT: AuditContext;
+}
+
+pub async fn with_audit_context<F: std::future::Future>(
+    context: AuditContext,
+    future: F,
+) -> F::Output {
+    CURRENT_AUDIT_CONTEXT.scope(context, future).await
+}
 
 /// Every agent is built once at boot. Requests only borrow them.
 pub type Registry = Arc<AgentRegistry>;
@@ -210,8 +242,13 @@ impl FilteredToolSink {
             .filter_map(|tool| {
                 let name = tool.name();
                 let is_allowed = tool_allowed(self.allowlist.as_ref(), name.as_ref());
-                tracing::info!(agent = %self.agent, server = %self.server, tool = %name, allowed = is_allowed, "MCP tool policy evaluated");
-                is_allowed.then(|| self.instrument_tool(tool))
+                if is_allowed {
+                    self.instrument_tool(tool).into()
+                } else {
+                    let context = CURRENT_AUDIT_CONTEXT.try_with(Clone::clone).unwrap_or_default();
+                    tracing::info!(request_id = %context.request_id, client_id = %context.client_id, client_name = %context.client_name, on_behalf_of = %context.on_behalf_of, agent = %self.agent, server = %self.server, tool = %name, decision = "denied", outcome = "ok", error_kind = "", duration_ms = 0_u64, args_sha256 = "", "MCP tool audit");
+                    None
+                }
             })
             .collect();
         // Denying by default is only usable if the operator can see what was denied. This is
@@ -244,9 +281,13 @@ impl FilteredToolSink {
                 let server = server.clone();
                 let tool_name = tool_name.clone();
                 Box::pin(async move {
-                    tracing::info!(agent = %agent, server = %server, tool = %tool_name, "MCP tool invocation started");
+                    let context = CURRENT_AUDIT_CONTEXT.try_with(Clone::clone).unwrap_or_default();
+                    let args_sha256 = canonical_args_sha256(&arguments);
+                    let started = std::time::Instant::now();
+                    tracing::info!(request_id = %context.request_id, client_id = %context.client_id, client_name = %context.client_name, on_behalf_of = %context.on_behalf_of, agent = %agent, server = %server, tool = %tool_name, decision = "allowed", outcome = "ok", error_kind = "", duration_ms = 0_u64, args_sha256 = %args_sha256, "MCP tool audit decision");
                     let result = source.run(arguments).await;
-                    tracing::info!(agent = %agent, server = %server, tool = %tool_name, succeeded = result.is_ok(), "MCP tool invocation finished");
+                    let error_kind = if result.is_err() { "tool_error" } else { "" };
+                    tracing::info!(request_id = %context.request_id, client_id = %context.client_id, client_name = %context.client_name, on_behalf_of = %context.on_behalf_of, agent = %agent, server = %server, tool = %tool_name, decision = "allowed", outcome = if result.is_ok() { "ok" } else { "error" }, error_kind, duration_ms = started.elapsed().as_millis() as u64, args_sha256 = %args_sha256, "MCP tool audit invocation");
                     result
                 })
             },
@@ -254,6 +295,11 @@ impl FilteredToolSink {
         .with_annotations(definition.annotations)
         .with_liveness(move || live_source.is_live())
     }
+}
+
+fn canonical_args_sha256(arguments: &Value) -> String {
+    let canonical = serde_json::to_vec(arguments).unwrap_or_default();
+    format!("{:x}", Sha256::digest(canonical))
 }
 
 impl ManagedToolSink for FilteredToolSink {
@@ -358,6 +404,43 @@ mod tests {
         )]);
 
         assert!(!handle.snapshot().contains("search"));
+    }
+
+    #[test]
+    fn tool_invocation_emits_audit_record_with_client_and_on_behalf_of() {
+        let sink = FilteredToolSink {
+            inner: rig::tool::server::ToolServer::new().run(),
+            allowlist: Some(HashSet::from(["lookup".to_string()])),
+            agent: "claims-agent".into(),
+            server: TEST_SERVER.into(),
+        };
+        let tool = sink.instrument_tool(named_tool("lookup"));
+        let args = serde_json::json!({"claim_id":"C-42"});
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let logs = capture_logs(|| {
+            assert!(runtime
+                .block_on(with_audit_context(
+                    AuditContext {
+                        request_id: "chatcmpl-test".into(),
+                        client_id: "claims-app".into(),
+                        client_name: "Claims application".into(),
+                        on_behalf_of: "user-42".into(),
+                    },
+                    tool.run(args),
+                ))
+                .is_ok());
+        });
+        assert!(logs.contains("client_id=claims-app"), "captured: {logs}");
+        assert!(logs.contains("on_behalf_of=user-42"), "captured: {logs}");
+        assert!(logs.contains("decision=\"allowed\""), "captured: {logs}");
+        assert!(
+            logs.contains("MCP tool audit invocation"),
+            "captured: {logs}"
+        );
+        assert!(!logs.contains("C-42"), "raw arguments leaked: {logs}");
     }
 
     #[test]
@@ -482,7 +565,7 @@ mod tests {
     /// make this assertion depend on model behaviour, which is not stable across runs or
     /// models, and a flaky security test teaches you to re-run until it goes green.
     #[test]
-    fn a_tool_offered_but_not_allowlisted_is_refused_and_the_refusal_names_server_and_tool() {
+    fn denied_tool_emits_audit_record_with_decision_denied() {
         let handle = rig::tool::server::ToolServer::new().run();
         let sink = FilteredToolSink {
             inner: handle.clone(),
@@ -505,7 +588,7 @@ mod tests {
         );
 
         assert!(
-            logs.contains("tool=delete") && logs.contains("allowed=false"),
+            logs.contains("tool=delete") && logs.contains("decision=\"denied\""),
             "the denial must name the tool that was refused; captured:\n{logs}"
         );
         assert!(
