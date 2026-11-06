@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rig::prelude::*;
-use rig::providers::{ollama, openai};
+use rig::providers::{anthropic, ollama, openai};
 use rig::tool::{server::ToolServerHandle, DynamicTool};
 use rig_core::tool::managed::{ManagedToolSink, ManagedToolToken};
 use serde_json::Value;
@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::config::{AgentConfig, McpServerConfig, Provider};
+use crate::config::{AgentConfig, McpServerConfig, Provider, Wire};
 
 #[derive(Clone, Debug)]
 pub struct AuditContext {
@@ -68,15 +68,27 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
             // `from_env` reads OPENAI_API_KEY and, if set, OPENAI_BASE_URL —
             // which is how you point it at Azure, vLLM, or an internal gateway.
             Provider::Openai => {
-                let client = openai::OpenAI::from_env().context(
+                let mut config = openai::OpenAIConfig::from_env().context(
                     "an openai agent needs OPENAI_API_KEY (and optionally OPENAI_BASE_URL)",
                 )?;
-                AgentBuilder::new(client.completion(cfg.model.as_str()))
+                // Rig defaults to the Responses API. Most OpenAI-compatible servers only
+                // implement Chat Completions, so an agent can opt into that wire.
+                if cfg.wire == Some(Wire::Chat) {
+                    config = config.with_route(openai::Route::Chat);
+                }
+                AgentBuilder::new(config.client().completion(cfg.model.as_str()))
             }
             // `from_env` reads OLLAMA_API_BASE_URL and OLLAMA_API_KEY, both optional.
             Provider::Ollama => {
                 let client = ollama::Ollama::from_env()
                     .context("an ollama agent could not read OLLAMA_API_BASE_URL")?;
+                AgentBuilder::new(client.completion(cfg.model.as_str()))
+            }
+            // `from_env` reads ANTHROPIC_API_KEY and, if set, ANTHROPIC_BASE_URL.
+            Provider::Anthropic => {
+                let client = anthropic::Anthropic::from_env().context(
+                    "an anthropic agent needs ANTHROPIC_API_KEY (and optionally ANTHROPIC_BASE_URL)",
+                )?;
                 AgentBuilder::new(client.completion(cfg.model.as_str()))
             }
         };

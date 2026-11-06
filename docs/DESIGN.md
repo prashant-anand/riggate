@@ -27,7 +27,8 @@ Cost: we inherit a specification we do not control, including fields we ignore.
 ## Providers configured by environment, not by file
 
 API keys never belong in a config file that gets committed. `rig`'s clients read
-`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OLLAMA_API_BASE_URL` directly, so the config file
+`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` /
+`OLLAMA_API_BASE_URL` directly, so the config file
 holds only names, models, and prompts.
 
 ## Errors carry meaning

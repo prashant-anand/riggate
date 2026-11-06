@@ -60,7 +60,7 @@ To test a local agent end to end, see the [smoke-agent example](examples/smoke-a
 
 - OpenAI Chat Completions requests at `/v1/chat/completions`, including server-sent event
   streaming.
-- Configured OpenAI, OpenAI-compatible, and Ollama providers. Provider credentials and base
+- Configured OpenAI, OpenAI-compatible, Anthropic, and Ollama providers. Provider credentials and base
   URLs come from environment variables.
 - Streamable HTTP MCP servers, with optional bearer credentials and per-server tool allowlists.
 - Request body limits, an upstream timeout, and a configurable limit on concurrent agent runs.
@@ -113,8 +113,10 @@ strict_requests = false
 
 [[agents]]
 name = "assistant"                # clients use this as the model name
-provider = "openai"               # openai or ollama
+provider = "openai"               # openai, anthropic, or ollama
 model = "gpt-5.5"
+# wire = "chat"                   # openai only: "responses" (default) or "chat" for servers
+#                                 # that only implement /chat/completions (vLLM, LiteLLM, ...)
 preamble = "You are a helpful assistant."
 max_turns = 10                     # model calls per request, including tool follow-ups
 
@@ -170,6 +172,8 @@ file.
 | `RIGGATE_API_KEY` | Protect API routes and allow non-loopback binds |
 | `OPENAI_API_KEY` | OpenAI provider credential |
 | `OPENAI_BASE_URL` | OpenAI-compatible endpoint, such as Azure OpenAI or vLLM |
+| `ANTHROPIC_API_KEY` | Anthropic provider credential |
+| `ANTHROPIC_BASE_URL` | Anthropic-compatible endpoint; defaults to the Anthropic API |
 | `OLLAMA_API_BASE_URL` | Ollama endpoint; defaults to `http://localhost:11434` |
 | MCP token variable | The variable named by an MCP server's `bearer_token_env` |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | OTLP log endpoint, when `"otlp"` is in `log_targets` |

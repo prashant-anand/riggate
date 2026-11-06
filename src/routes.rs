@@ -625,6 +625,23 @@ async fn chat_inner(
         Ok(Ok(res)) => {
             tracing::Span::current().record("prompt_tokens", res.usage.input_tokens);
             tracing::Span::current().record("completion_tokens", res.usage.output_tokens);
+            let finish_reason = completion_finish_reason(
+                res.completion_calls
+                    .last()
+                    .and_then(|call| call.finish_reason.clone()),
+                res.usage.output_tokens,
+                req.max_tokens.or(req.max_completion_tokens),
+            );
+            // A reply with no text that was not cut off by a token limit almost always means
+            // the upstream answered in a dialect this agent does not speak (for example a
+            // Chat Completions server behind an agent using the Responses API). Say so
+            // rather than hand the client a successful empty answer.
+            if res.output().trim().is_empty() && finish_reason != "length" {
+                return Err(err(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream returned an empty answer; check the agent's provider, wire and base URL",
+                ));
+            }
             Ok(Json(json!(ChatResponse {
                 id: request_id,
                 object: "chat.completion",
@@ -635,13 +652,7 @@ async fn chat_inner(
                         role: "assistant",
                         content: res.output().to_string(),
                     },
-                    finish_reason: completion_finish_reason(
-                        res.completion_calls
-                            .last()
-                            .and_then(|call| call.finish_reason.clone()),
-                        res.usage.output_tokens,
-                        req.max_tokens.or(req.max_completion_tokens),
-                    ),
+                    finish_reason,
                 }],
                 usage: UsageOut {
                     prompt_tokens: res.usage.input_tokens,

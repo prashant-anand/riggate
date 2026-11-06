@@ -77,6 +77,19 @@ pub enum Provider {
     Openai,
     /// A local Ollama server inside your network.
     Ollama,
+    /// Anthropic Claude, or an Anthropic-compatible endpoint set with `ANTHROPIC_BASE_URL`.
+    Anthropic,
+}
+
+/// Which OpenAI endpoint an `openai` agent talks to.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Wire {
+    /// `POST /responses`, OpenAI's current API. The default.
+    #[default]
+    Responses,
+    /// `POST /chat/completions`, which every OpenAI-compatible server serves.
+    Chat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +99,10 @@ pub struct AgentConfig {
     pub provider: Provider,
     /// Upstream model id, e.g. "gpt-5.5" or "llama3.1:8b".
     pub model: String,
+    /// Which OpenAI endpoint to use; only valid with `provider = "openai"`. Servers such as vLLM
+    /// or LiteLLM usually offer only `chat`.
+    #[serde(default)]
+    pub wire: Option<Wire>,
     /// System prompt.
     #[serde(default)]
     pub preamble: Option<String>,
@@ -155,6 +172,12 @@ impl Config {
             }
             if a.max_turns == 0 {
                 bail!("agent '{}' max_turns must be greater than zero", a.name);
+            }
+            if a.wire.is_some() && a.provider != Provider::Openai {
+                bail!(
+                    "agent '{}' sets wire, which only applies to provider = \"openai\"",
+                    a.name
+                );
             }
             for server in &a.mcp_servers {
                 if server.url.trim().is_empty() {
@@ -301,6 +324,42 @@ preamble = "Be brief."
             .unwrap_err()
             .to_string();
         assert!(err.contains("no [[agents]]"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_the_anthropic_provider() {
+        let cfg = Config::parse(
+            "[[agents]]\nname=\"a\"\nprovider=\"anthropic\"\nmodel=\"claude-sonnet-5-5\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agents[0].provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn wire_defaults_to_unset_and_accepts_chat_and_responses() {
+        let base = "[[agents]]\nname=\"a\"\nprovider=\"openai\"\nmodel=\"m\"\n";
+        assert_eq!(Config::parse(base).unwrap().agents[0].wire, None);
+        for (value, expected) in [("chat", Wire::Chat), ("responses", Wire::Responses)] {
+            let cfg = Config::parse(&format!("{base}wire=\"{value}\"\n")).unwrap();
+            assert_eq!(cfg.agents[0].wire, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_wire() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"openai\"\nmodel=\"m\"\nwire=\"soap\"\n";
+        assert!(Config::parse(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_wire_on_a_provider_that_has_no_such_choice() {
+        for provider in ["ollama", "anthropic"] {
+            let raw = format!(
+                "[[agents]]\nname=\"a\"\nprovider=\"{provider}\"\nmodel=\"m\"\nwire=\"chat\"\n"
+            );
+            let err = Config::parse(&raw).unwrap_err().to_string();
+            assert!(err.contains("wire"), "{err}");
+        }
     }
 
     #[test]

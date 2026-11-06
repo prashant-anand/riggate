@@ -50,7 +50,10 @@ max_turns = 10 # Model calls per request, including tool follow-ups; must be > 0
 # allowed_tools = ["search", "read"] # Deny by default: name each tool the agent may use.
 
 # A hosted model. Comment out this block to run only the local model without OpenAI credentials.
-# Provider is "openai" or "ollama". This model requires OPENAI_API_KEY.
+# Provider is "openai", "anthropic" or "ollama". This model requires OPENAI_API_KEY.
+# Behind a server that only implements /chat/completions (vLLM, LiteLLM), add: wire = "chat"
+# For Claude, use provider = "anthropic", a model such as "claude-sonnet-5-5", and set
+# ANTHROPIC_API_KEY.
 [[agents]]
 name = "assistant" # Client-facing name; must not be blank and should be unique.
 provider = "openai"
