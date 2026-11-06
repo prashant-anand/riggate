@@ -18,6 +18,12 @@ user message script richer behaviour, one directive per line:
                                  (an upstream that ignores the Responses API)
   MOCK_GARBAGE                   reply 200 with a body in no dialect (a misconfigured upstream)
 
+Set MOCK_POLICY to the path of a Python file defining `policy(state) -> dict | None` to script
+a whole "model": `state` has `messages` (chat-style, tool results as role "tool"), `instructions`
+(the system prompt) and `tools` (offered tool names). Return {"tool_calls": [{"name": ...,
+"arguments": {...}}]} or {"text": "..."}; None falls back to the directives above. Directives in
+the user message always win, so a test can still force a specific call.
+
 Set MOCK_REQUEST_LOG to a file path to append every request (path, auth headers, body) as one
 JSON line, so a test can assert what Riggate sent upstream (history, offered tools, credentials).
 """
@@ -98,6 +104,40 @@ def parse_directives(messages):
     return [(kind, rest.strip()) for kind, rest in DIRECTIVE.findall(last_user_text(messages))]
 
 
+_POLICY = None
+
+
+def load_policy():
+    """Import the MOCK_POLICY file once; None when unset."""
+    global _POLICY
+    path = os.environ.get("MOCK_POLICY")
+    if path and _POLICY is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mock_policy", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _POLICY = module.policy
+    return _POLICY
+
+
+def offered_tool_names(req):
+    names = []
+    for tool in req.get("tools") or []:
+        names.append(tool.get("name") or (tool.get("function") or {}).get("name"))
+    return [n for n in names if n]
+
+
+def system_prompt(req, messages):
+    if isinstance(req.get("system"), str):
+        return req["system"]
+    if req.get("instructions"):
+        return req["instructions"]
+    for message in messages:
+        if message.get("role") == "system":
+            return text_of(message.get("content"))
+    return ""
+
+
 def split_call(rest):
     name, _, args = rest.partition(" ")
     return name, (args.strip() or "{}")
@@ -165,6 +205,19 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
             if kind == "LOOP" or (kind == "TOOL" and not results):
                 name, args = split_call(rest)
                 calls.append({"name": name, "arguments": args})
+
+        policy = load_policy()
+        if policy and not directives:
+            decision = policy({
+                "messages": messages,
+                "instructions": system_prompt(req, messages),
+                "tools": offered_tool_names(req),
+            })
+            if decision and "tool_calls" in decision:
+                calls = [{"name": c["name"], "arguments": json.dumps(c.get("arguments", {}))}
+                         for c in decision["tool_calls"]]
+            elif decision and "text" in decision:
+                return self._respond_text(req, model, decision["text"], responses_api, anthropic_api)
 
         if calls:
             return self._respond_tool_calls(req, model, calls, responses_api, anthropic_api)
