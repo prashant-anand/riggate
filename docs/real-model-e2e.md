@@ -118,3 +118,52 @@ Total request duration: 8.1 s on a 7B model on a laptop, tool call included.
 
 `cargo test` — 51 tests, three consecutive runs, no flakes. `cargo clippy --all-targets -- -D
 warnings` clean. `cargo fmt --all -- --check` clean.
+
+## Second run: Anthropic (`claude-haiku-5-5`), 10 repetitions, 10-Nov-2026
+
+**Status: verified on 10-Nov-2026**, against Riggate `72d9602` (branch `feat/anthropic-chat-wire`),
+debug build, `linux x86_64` (WSL2). This repeats the mechanism check with a hosted model and adds a
+repetition count, so it is the first number here that says anything about reliability.
+
+| Component | What |
+|---|---|
+| Model | `claude-haiku-5-5`, `provider = "anthropic"`, key from `ANTHROPIC_API_KEY` |
+| MCP server | `scripts/mock_mcp.py` (Streamable HTTP, `echo` / `add` / `danger`) with `MOCK_MCP_TOKEN`, so `bearer_token_env` was exercised |
+| Allowlist | `allowed_tools = ["echo", "add"]`; `danger` is advertised by the server and left off |
+| Agents | `claude` (`max_turns = 6`) and `capped` (`max_turns = 1`, preamble forces a tool call first) |
+
+Each of the five checks ran 10 times (50 requests). Every request used a fresh random value
+(a nonce for `echo`, random operands for `add`), and success was judged from two sides: the answer
+the caller got, and the call the MCP server actually received (`MOCK_MCP_LOG`).
+
+| Check | Pass criterion | Result |
+|---|---|---|
+| Baseline | `200`, answer contains `pong` | 10/10 |
+| `echo` | `200`, answer contains the nonce, server received `echo` with that exact text | 10/10 |
+| `add` | `200`, answer contains the correct sum, server received `add` | 10/10 |
+| Non-allowlisted tool | Prompt asks for `danger`; the server never receives a `danger` call | 10/10 |
+| `max_turns = 1` | `502` with `reached the max turns limit of 1` | 10/10 |
+
+Audit log over the run: 2 `denied` decisions (`danger`, one per agent, at startup) and 60 `allowed`
+(`echo`/`add` decision plus invocation). Reported usage for the 40 non-error requests: 30,686
+prompt and 2,597 completion tokens.
+
+An earlier single pass on the same day (without the bearer token) gave the same outcomes.
+
+### What this does and does not show
+
+- **It shows** that a hosted Claude model drives permitted MCP tools through the gateway, that the
+  server-side call matches the answer, that the bearer token is sent, and that the turn limit
+  surfaces as a `502`.
+- **`danger` is never advertised to the model.** The model said no such tool exists, so this checks
+  that the allowlist filters what the model can see. It does not check what happens if a model
+  calls a denied tool anyway; that remains covered by the `agent::tests` unit tests.
+- **Sample size is 10 per check, one model, one prompt each.** 10/10 does not support a claim of a
+  near-100% rate. It does not cover harder prompts, ambiguous tool choices, or other models.
+- **The empty-reply `502` path was not exercised.** A real model does not produce an empty reply on
+  demand; the mock provider covers it.
+- **Not tested:** stdio transport, a real third-party MCP server, concurrent requests.
+- **Not in CI.** It needs a paid API key and was run by hand.
+
+Every request logs `WARN request has no end-user attribution`, because the test client sent no
+end-user identity. That is expected for this run.
