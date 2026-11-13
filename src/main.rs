@@ -2,6 +2,7 @@ mod agent;
 mod auth;
 mod config;
 mod routes;
+mod supervise;
 
 use anyhow::{Context, Result};
 use opentelemetry::KeyValue;
@@ -140,7 +141,7 @@ async fn serve_initialized(cfg: config::Config) -> Result<()> {
     }
     let registry = agent::build(&cfg.agents).await?;
     let app = routes::router_with_clients(
-        registry,
+        registry.clone(),
         clients,
         routes::RequestLimits {
             max_request_bytes: cfg.max_request_bytes,
@@ -191,6 +192,8 @@ async fn serve_initialized(cfg: config::Config) -> Result<()> {
         }
     };
 
+    // Requests have drained (or the grace period gave up on them); now stop the children.
+    registry.shutdown(grace).await;
     server_result?;
     Ok(())
 }

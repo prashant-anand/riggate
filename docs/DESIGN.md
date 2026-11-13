@@ -55,7 +55,7 @@ the text chunks.
 
 ## Tools come from MCP servers
 
-An agent may configure Streamable HTTP MCP endpoints. At startup Riggate connects each
+An agent may configure Streamable HTTP MCP endpoints or stdio child processes (see the README for the trust and supervision model). At startup Riggate connects each
 endpoint, registers its tools with Rig, and holds the connection for the agent's lifetime.
 `max_turns` bounds the model calls made by a request, including tool follow-ups. This makes
 tools configurable without compiling tool implementations into the server binary.

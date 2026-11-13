@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{AgentConfig, McpServerConfig, Provider, Wire};
+use crate::supervise::Backoff;
 
 #[derive(Clone, Debug)]
 pub struct AuditContext {
@@ -47,6 +48,37 @@ pub struct AgentRegistry {
     agents: HashMap<String, Agent>,
     // MCP services must stay alive for registered tools to keep working.
     _mcp_services: Mutex<Vec<Box<dyn Send>>>,
+    /// One task per stdio MCP server; each owns a child process.
+    supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl AgentRegistry {
+    #[cfg(test)]
+    fn bare(agents: HashMap<String, Agent>) -> Self {
+        Self {
+            agents,
+            _mcp_services: Mutex::new(Vec::new()),
+            supervisors: Mutex::new(Vec::new()),
+            stop: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// Stop every supervised stdio child and wait for it to be reaped, up to `grace`. Called
+    /// after the HTTP server has drained so no in-flight request loses its tool mid-call.
+    pub async fn shutdown(&self, grace: std::time::Duration) {
+        let _ = self.stop.send(true);
+        let handles = std::mem::take(&mut *self.supervisors.lock().unwrap());
+        stop_supervisors(handles, grace).await;
+    }
+}
+
+async fn stop_supervisors(handles: Vec<tokio::task::JoinHandle<()>>, grace: std::time::Duration) {
+    for handle in handles {
+        if tokio::time::timeout(grace, handle).await.is_err() {
+            tracing::warn!("a stdio MCP supervisor did not stop within the grace period");
+        }
+    }
 }
 
 impl AgentRegistry {
@@ -60,8 +92,33 @@ impl AgentRegistry {
 }
 
 pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
-    let mut agents = HashMap::new();
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let mut mcp_services: Vec<Box<dyn Send>> = Vec::new();
+    let mut supervisors: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    match build_agents(configs, &stop_rx, &mut mcp_services, &mut supervisors).await {
+        Ok(agents) => Ok(Arc::new(AgentRegistry {
+            agents,
+            _mcp_services: Mutex::new(mcp_services),
+            supervisors: Mutex::new(supervisors),
+            stop,
+        })),
+        Err(error) => {
+            // A later agent failed after earlier ones already spawned children. Do not leave
+            // them running behind a gateway that is about to exit with an error.
+            let _ = stop.send(true);
+            stop_supervisors(supervisors, std::time::Duration::from_secs(5)).await;
+            Err(error)
+        }
+    }
+}
+
+async fn build_agents(
+    configs: &[AgentConfig],
+    stop_rx: &tokio::sync::watch::Receiver<bool>,
+    mcp_services: &mut Vec<Box<dyn Send>>,
+    supervisors: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Result<HashMap<String, Agent>> {
+    let mut agents = HashMap::new();
 
     for cfg in configs {
         let builder = match cfg.provider {
@@ -97,16 +154,32 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
         if !cfg.mcp_servers.is_empty() {
             let tool_server = rig::tool::server::ToolServer::new().run();
             for server in &cfg.mcp_servers {
-                mcp_services.push(
-                    connect_mcp(server, &tool_server, &cfg.name)
+                let context = || {
+                    format!(
+                        "connecting MCP server {} for agent '{}'",
+                        server.display_name(),
+                        cfg.name
+                    )
+                };
+                if server.command.is_some() {
+                    supervisors.push(
+                        start_stdio(
+                            server,
+                            &tool_server,
+                            &cfg.name,
+                            stop_rx.clone(),
+                            Backoff::default(),
+                        )
                         .await
-                        .with_context(|| {
-                            format!(
-                                "connecting MCP server {} for agent '{}'",
-                                server.url, cfg.name
-                            )
-                        })?,
-                );
+                        .with_context(context)?,
+                    );
+                } else {
+                    mcp_services.push(
+                        connect_mcp(server, &tool_server, &cfg.name)
+                            .await
+                            .with_context(context)?,
+                    );
+                }
             }
             builder = builder.tool_server_handle(tool_server);
         }
@@ -114,10 +187,7 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
         agents.insert(cfg.name.clone(), agent);
     }
 
-    Ok(Arc::new(AgentRegistry {
-        agents,
-        _mcp_services: Mutex::new(mcp_services),
-    }))
+    Ok(agents)
 }
 
 #[cfg(test)]
@@ -129,10 +199,7 @@ pub(crate) fn test_registry(base_url: &str) -> Registry {
     let agent = AgentBuilder::new(client.completion("mock-model")).build();
     let mut agents = HashMap::new();
     agents.insert("mock".to_string(), agent);
-    Arc::new(AgentRegistry {
-        agents,
-        _mcp_services: Mutex::new(Vec::new()),
-    })
+    Arc::new(AgentRegistry::bare(agents))
 }
 
 /// Like [`test_registry`], but the agent owns a tool server holding one permitted tool,
@@ -182,10 +249,7 @@ pub(crate) fn test_registry_with_tools(
         .build();
     let mut agents = HashMap::new();
     agents.insert("mock".to_string(), agent);
-    Arc::new(AgentRegistry {
-        agents,
-        _mcp_services: Mutex::new(Vec::new()),
-    })
+    Arc::new(AgentRegistry::bare(agents))
 }
 
 fn build_agent(builder: AgentBuilder, cfg: &AgentConfig) -> Agent {
@@ -195,16 +259,13 @@ fn build_agent(builder: AgentBuilder, cfg: &AgentConfig) -> Agent {
     }
 }
 
-async fn connect_mcp(
+fn mcp_handler(
     server: &McpServerConfig,
     tool_server: &rig::tool::server::ToolServerHandle,
     agent: &str,
-) -> Result<Box<dyn Send>> {
+) -> rig::tool::rmcp::McpClientHandler<FilteredToolSink> {
     use rig::tool::rmcp::{
-        rmcp::{
-            model::{ClientCapabilities, ClientConfig, Implementation},
-            transport::StreamableHttpClientTransport,
-        },
+        rmcp::model::{ClientCapabilities, ClientConfig, Implementation},
         McpClientHandler,
     };
 
@@ -216,25 +277,139 @@ async fn connect_mcp(
         .allowed_tools
         .as_ref()
         .map(|tools| tools.iter().cloned().collect());
+    // The same sink wraps both transports, so tool policy and audit lines cannot depend on
+    // how the server is reached.
     let sink = FilteredToolSink {
         inner: tool_server.clone(),
         allowlist,
         agent: agent.to_string(),
-        server: server.url.clone(),
+        server: server.display_name(),
     };
-    let handler = McpClientHandler::new(client_info, sink);
+    McpClientHandler::new(client_info, sink)
+}
+
+async fn connect_mcp(
+    server: &McpServerConfig,
+    tool_server: &rig::tool::server::ToolServerHandle,
+    agent: &str,
+) -> Result<Box<dyn Send>> {
+    use rig::tool::rmcp::rmcp::transport::StreamableHttpClientTransport;
+
+    let name = server.display_name();
+    let url = server
+        .url
+        .clone()
+        .context("MCP server has no url; stdio servers are supervised")?;
     let token = server
         .bearer_token_env
         .as_deref()
         .map(read_mcp_token)
         .transpose()?;
-    let transport_config = mcp_transport_config(server.url.clone(), token)?;
-    let transport = StreamableHttpClientTransport::from_config(transport_config);
-    let connection = handler
+    let transport = StreamableHttpClientTransport::from_config(mcp_transport_config(url, token)?);
+    let connection = mcp_handler(server, tool_server, agent)
         .connect(transport)
         .await
-        .with_context(|| format!("MCP connection to {} failed", server.url))?;
+        .with_context(|| format!("MCP connection to {name} failed"))?;
     Ok(Box::new(connection))
+}
+
+/// Spawn the child once and complete the MCP handshake. Called again by the supervisor
+/// after every exit, so it builds everything it needs fresh: a command, a handler, a pipe.
+async fn connect_stdio_once(
+    server: &McpServerConfig,
+    tool_server: &rig::tool::server::ToolServerHandle,
+    agent: &str,
+) -> Result<rig::tool::rmcp::McpConnection> {
+    use rig::tool::rmcp::rmcp::transport::TokioChildProcess;
+
+    let name = server.display_name();
+    let mut command = stdio_command(server, |var| std::env::var(var).ok());
+    // Backstop: if the transport is dropped on any path, the child gets SIGKILL
+    // synchronously rather than depending on a task that may never run at shutdown.
+    command.kill_on_drop(true);
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning MCP server {name}"))?;
+    if let Some(stderr) = stderr {
+        tokio::spawn(crate::supervise::forward_stderr(
+            stderr,
+            agent.to_string(),
+            name.clone(),
+        ));
+    }
+    mcp_handler(server, tool_server, agent)
+        .connect(transport)
+        .await
+        .with_context(|| format!("MCP connection to {name} failed"))
+}
+
+/// Start supervising a stdio server and wait for its first handshake, so the gateway does
+/// not begin serving with a tool server that never came up.
+async fn start_stdio(
+    server: &McpServerConfig,
+    tool_server: &rig::tool::server::ToolServerHandle,
+    agent: &str,
+    stop: tokio::sync::watch::Receiver<bool>,
+    backoff: Backoff,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let (server_cfg, tools, agent_name) = (server.clone(), tool_server.clone(), agent.to_string());
+    let name = server.display_name();
+    let handle = tokio::spawn(crate::supervise::supervise(
+        agent.to_string(),
+        name,
+        move || {
+            let (server, tools, agent) = (server_cfg.clone(), tools.clone(), agent_name.clone());
+            async move { connect_stdio_once(&server, &tools, &agent).await }
+        },
+        stop,
+        first_tx,
+        backoff,
+    ));
+    match first_rx.await {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(error)) => {
+            let _ = handle.await;
+            Err(error)
+        }
+        Err(_) => anyhow::bail!("stdio MCP supervisor ended before the first connection"),
+    }
+}
+
+/// The complete environment a stdio child receives: the literal `env` entries plus the
+/// `inherit_env` names that are set in the gateway. Nothing else. This is a pure function
+/// of the config and a lookup so the fail-closed behavior is testable without touching the
+/// real process environment.
+fn child_environment(
+    server: &McpServerConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = server
+        .inherit_env
+        .iter()
+        .filter_map(|name| lookup(name).map(|value| (name.clone(), value)))
+        .collect();
+    vars.extend(server.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    vars
+}
+
+/// Build the child command with `env_clear()` first: `Command` inherits the parent's
+/// environment unless told otherwise, which would hand `OPENAI_API_KEY` and
+/// `RIGGATE_API_KEY` to every MCP server.
+fn stdio_command(
+    server: &McpServerConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(server.command.as_deref().unwrap_or_default());
+    command
+        .args(&server.args)
+        .env_clear()
+        .envs(child_environment(server, lookup));
+    if let Some(dir) = &server.working_dir {
+        command.current_dir(dir);
+    }
+    command
 }
 
 struct FilteredToolSink {
@@ -366,6 +541,68 @@ fn mcp_transport_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stdio_server(env: &[(&str, &str)], inherit: &[&str]) -> McpServerConfig {
+        McpServerConfig {
+            url: None,
+            bearer_token_env: None,
+            command: Some("/bin/true".to_string()),
+            args: vec![],
+            working_dir: None,
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            inherit_env: inherit.iter().map(|s| s.to_string()).collect(),
+            allowed_tools: None,
+        }
+    }
+
+    fn gateway_env(name: &str) -> Option<String> {
+        match name {
+            "OPENAI_API_KEY" => Some("sk-secret".into()),
+            "RIGGATE_API_KEY" => Some("gw-secret".into()),
+            "HOME" => Some("/home/x".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn child_inherits_nothing_by_default() {
+        let server = stdio_server(&[], &[]);
+        assert!(child_environment(&server, gateway_env).is_empty());
+    }
+
+    #[test]
+    fn child_gets_only_named_variables() {
+        let server = stdio_server(&[("TZ", "UTC")], &["HOME", "NOT_SET"]);
+        let vars = child_environment(&server, gateway_env);
+        assert_eq!(
+            vars,
+            vec![
+                ("HOME".to_string(), "/home/x".to_string()),
+                ("TZ".to_string(), "UTC".to_string())
+            ]
+        );
+        assert!(!vars.iter().any(|(k, _)| k.ends_with("_API_KEY")));
+    }
+
+    #[tokio::test]
+    async fn spawned_child_does_not_see_gateway_secrets() {
+        // Set a secret in the real process env, then spawn a real child that dumps its env.
+        // SAFETY: test-only; the variable name is unique to this test.
+        unsafe { std::env::set_var("RIGGATE_TEST_LEAK_CANARY", "leaked") };
+        let mut server = stdio_server(&[("KEPT", "yes")], &[]);
+        server.command = Some("/usr/bin/env".to_string());
+        let out = stdio_command(&server, |v| std::env::var(v).ok())
+            .output()
+            .await
+            .expect("run env");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("KEPT=yes"), "env was: {text}");
+        assert!(!text.contains("RIGGATE_TEST_LEAK_CANARY"), "leaked: {text}");
+        assert!(!text.contains("PATH="), "PATH leaked: {text}");
+    }
 
     #[test]
     fn denies_every_tool_when_no_allowlist_is_configured() {
@@ -639,6 +876,173 @@ mod tests {
         assert!(
             logs.contains(TEST_SERVER),
             "the warning must name the server to fix; captured:\n{logs}"
+        );
+    }
+
+    // A fake stdio MCP server. Each start appends its pid to $FAKE_LOG; with $FAKE_CRASH_ONCE
+    // set it dies right after its first tools/list, which is what the restart test needs.
+    const FAKE_SERVER: &str = r#"
+import json, os, sys
+with open(os.environ["FAKE_LOG"], "a") as f:
+    f.write(str(os.getpid()) + "\n")
+sys.stderr.write("fake server booted\n"); sys.stderr.flush()
+crash = os.environ.get("FAKE_CRASH_ONCE")
+first = not os.path.exists(crash) if crash else False
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    if mid is None:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": msg["params"]["protocolVersion"],
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "fake", "version": "0"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "get_time", "description": "t",
+                             "inputSchema": {"type": "object"}}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+    if method == "tools/list" and first:
+        open(crash, "w").close()
+        os._exit(1)
+"#;
+
+    struct Fake {
+        dir: std::path::PathBuf,
+        server: McpServerConfig,
+    }
+
+    fn fake(name: &str, crash_once: bool) -> Fake {
+        let dir = std::env::temp_dir().join(format!("riggate-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server.py");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "FAKE_LOG".to_string(),
+            dir.join("log").display().to_string(),
+        );
+        if crash_once {
+            env.insert(
+                "FAKE_CRASH_ONCE".to_string(),
+                dir.join("crashed").display().to_string(),
+            );
+        }
+        let server = McpServerConfig {
+            url: None,
+            bearer_token_env: None,
+            // Bare name on purpose: resolved on the gateway's PATH although the child gets none.
+            command: Some("python3".to_string()),
+            args: vec!["-I".into(), script.display().to_string()],
+            working_dir: None,
+            env,
+            inherit_env: vec![],
+            allowed_tools: Some(vec!["*".to_string()]),
+        };
+        Fake { dir, server }
+    }
+
+    fn starts(dir: &std::path::Path) -> Vec<u32> {
+        std::fs::read_to_string(dir.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.parse().ok())
+            .collect()
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| s.contains(") Z"))
+                .unwrap_or(true)
+    }
+
+    async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    async fn tool_names(tools: &ToolServerHandle) -> Vec<String> {
+        tools
+            .tool_defs(None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.name.to_string())
+            .collect()
+    }
+
+    fn fast() -> Backoff {
+        Backoff {
+            base: std::time::Duration::from_millis(50),
+            max: std::time::Duration::from_millis(200),
+            healthy_after: std::time::Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_server_registers_tools_and_is_reaped_on_shutdown() {
+        let f = fake("shutdown", false);
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+            .await
+            .unwrap();
+        assert_eq!(tool_names(&tools).await, vec!["get_time"]);
+        let pid = starts(&f.dir)[0];
+        assert!(pid_alive(pid));
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        wait_for("child to be reaped", || !pid_alive(pid)).await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn a_crashed_stdio_server_is_restarted_and_its_tools_return() {
+        let f = fake("restart", true);
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+            .await
+            .unwrap();
+
+        wait_for("a second start", || starts(&f.dir).len() >= 2).await;
+        for _ in 0..200 {
+            if tool_names(&tools).await == vec!["get_time"] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(tool_names(&tools).await, vec!["get_time"]);
+        let pids = starts(&f.dir);
+        assert!(!pid_alive(pids[0]), "the crashed child must not linger");
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        wait_for("restarted child to be reaped", || !pid_alive(pids[1])).await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn a_missing_command_fails_startup_instead_of_serving_without_it() {
+        let mut server = fake("missing", false).server;
+        server.command = Some("/nonexistent/riggate-mcp".to_string());
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let err = start_stdio(&server, &tools, "a", stop_rx, fast())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("spawning MCP server"),
+            "{err:#}"
         );
     }
 }

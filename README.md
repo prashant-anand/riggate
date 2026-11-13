@@ -62,7 +62,8 @@ To test a local agent end to end, see the [smoke-agent example](examples/smoke-a
   streaming.
 - Configured OpenAI, OpenAI-compatible, Anthropic, and Ollama providers. Provider credentials and base
   URLs come from environment variables.
-- Streamable HTTP MCP servers, with optional bearer credentials and per-server tool allowlists.
+- Streamable HTTP and stdio (child process) MCP servers, with per-server tool allowlists and, for
+  HTTP, optional bearer credentials.
 - Request body limits, an upstream timeout, and a configurable limit on concurrent agent runs.
 - Stateless conversations: clients send the conversation history with each request.
 
@@ -124,6 +125,15 @@ max_turns = 10                     # model calls per request, including tool fol
 url = "http://127.0.0.1:9000/mcp"
 # bearer_token_env = "MCP_SEARCH_TOKEN"
 # allowed_tools = ["search", "read"]
+
+# Or run an MCP server as a child process instead of connecting to a URL:
+# [[agents.mcp_servers]]
+# command = "/usr/local/bin/mcp-server-time"
+# args = ["--local-timezone", "UTC"]
+# working_dir = "/var/lib/riggate"
+# env = { LOG_LEVEL = "warn" }      # literal values handed to the child
+# inherit_env = ["HOME"]            # gateway variables copied into the child
+# allowed_tools = ["get_current_time"]
 ```
 
 The top-level request controls default to a 1 MiB body limit, 64 concurrent agent runs, and a
@@ -205,8 +215,35 @@ arguments are represented only by their SHA-256 hash. For example:
 {"request_id":"chatcmpl-abc123","client_id":"claims-app","client_name":"Claims application","on_behalf_of":"user-42","agent":"assistant","server":"http://mcp.internal/mcp","tool":"lookup_claim","decision":"allowed","outcome":"ok","error_kind":"","duration_ms":18,"args_sha256":"…","message":"MCP tool audit"}
 ```
 
-MCP endpoints must be reachable from the Riggate host. Riggate currently supports Streamable
-HTTP transport; stdio transport is not implemented.
+### Stdio MCP servers
+
+Each server sets exactly one of `url` or `command`. A `command` server is a child process of the
+gateway, which makes the config file executable in effect: **it names programs the gateway will
+run with the gateway's privileges.** Give it the review and file permissions you would give code,
+and keep it writable only by the account that administers the gateway.
+
+- **Environment is scrubbed.** The child starts with an empty environment and receives only the
+  literal `env` entries plus the gateway variables named in `inherit_env`. `OPENAI_API_KEY`,
+  `RIGGATE_API_KEY` and client token variables are never passed unless you name them. A name in
+  both `env` and `inherit_env` is rejected. This includes `PATH`: a bare `command` is looked up
+  on the gateway's own `PATH`, but the child does not get one. Launchers that start further
+  programs (`npx`, `uvx`) need `inherit_env = ["PATH"]`; an absolute `command` avoids depending
+  on the gateway's `PATH`.
+- **Readiness.** Riggate waits for the MCP handshake before it starts listening, and refuses to
+  start if a stdio server cannot be spawned or initialised, as it does for HTTP servers.
+- **Supervision.** If a child exits, Riggate restarts it with exponential backoff (1 s doubling
+  to 30 s, reset after a connection stays up for 60 s). While it is down its tools are not
+  offered to the model; they return when it reconnects, under the same `allowed_tools` policy.
+- **stderr** is logged, one event per line, with `agent`, `server` and `stream="stderr"`, so it
+  follows your `log_targets`. Lines longer than 8 KiB are split.
+- **Shutdown.** After in-flight requests drain, the child's stdin is closed and it is killed;
+  Riggate does not exit while a supervised child it started is running. A child that is
+  itself a launcher can leave its own children behind: only the process Riggate started is
+  tracked.
+- **Config reload** does not exist yet (change the file and restart), so there is no reload
+  path to clean up.
+
+HTTP MCP endpoints must be reachable from the Riggate host.
 
 ## Built with Rig
 
