@@ -1,7 +1,11 @@
 mod agent;
 mod auth;
+mod child;
 mod config;
 mod routes;
+mod supervise;
+#[cfg(test)]
+mod testlog;
 
 use anyhow::{Context, Result};
 use opentelemetry::KeyValue;
@@ -27,7 +31,7 @@ OPTIONS:
 
 ENDPOINTS:
     GET  /healthz                 liveness probe
-    GET  /readyz                  startup readiness probe
+    GET  /readyz                  readiness probe (MCP servers connected)
     GET  /v1/models               configured agents, OpenAI shape
     POST /v1/chat/completions     run an agent, OpenAI shape
 ";
@@ -140,7 +144,7 @@ async fn serve_initialized(cfg: config::Config) -> Result<()> {
     }
     let registry = agent::build(&cfg.agents).await?;
     let app = routes::router_with_clients(
-        registry,
+        registry.clone(),
         clients,
         routes::RequestLimits {
             max_request_bytes: cfg.max_request_bytes,
@@ -160,8 +164,11 @@ async fn serve_initialized(cfg: config::Config) -> Result<()> {
     // manager's SIGKILL, which loses the same work with less explanation.
     let grace = std::time::Duration::from_secs(cfg.shutdown_grace_seconds);
     let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+    let draining = registry.clone();
     tokio::spawn(async move {
         shutdown().await;
+        // Fail readiness first so a load balancer stops routing here while requests finish.
+        draining.begin_drain();
         let _ = signal_tx.send(true);
     });
 
@@ -191,6 +198,8 @@ async fn serve_initialized(cfg: config::Config) -> Result<()> {
         }
     };
 
+    // Requests have drained (or the grace period gave up on them); now stop the children.
+    registry.shutdown(grace).await;
     server_result?;
     Ok(())
 }

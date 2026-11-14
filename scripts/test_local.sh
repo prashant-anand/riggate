@@ -210,7 +210,7 @@ test_assert "Unattributed request logs warning 'request has no end-user attribut
 echo ""
 echo "6. Rust Test Suite (Audit Context, Tool Decision & Argument SHA-256 Hashing)"
 if cargo test --quiet; then
-    echo "  [PASS] All 59 Rust unit and integration tests passed"
+    echo "  [PASS] All Rust unit and integration tests passed"
     PASSED=$((PASSED + 1))
 else
     echo "  [FAIL] Rust test suite failed" >&2

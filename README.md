@@ -60,9 +60,10 @@ To test a local agent end to end, see the [smoke-agent example](examples/smoke-a
 
 - OpenAI Chat Completions requests at `/v1/chat/completions`, including server-sent event
   streaming.
-- Configured OpenAI, OpenAI-compatible, and Ollama providers. Provider credentials and base
+- Configured OpenAI, OpenAI-compatible, Anthropic, and Ollama providers. Provider credentials and base
   URLs come from environment variables.
-- Streamable HTTP MCP servers, with optional bearer credentials and per-server tool allowlists.
+- Streamable HTTP and stdio (child process) MCP servers, with per-server tool allowlists and, for
+  HTTP, optional bearer credentials.
 - Request body limits, an upstream timeout, and a configurable limit on concurrent agent runs.
 - Stateless conversations: clients send the conversation history with each request.
 
@@ -77,7 +78,7 @@ default; set `strict_requests = true` to reject them. Invalid option values retu
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/healthz` | Liveness check; does not require authentication |
-| `GET` | `/readyz` | Startup readiness; does not require authentication |
+| `GET` | `/readyz` | Readiness: `200` when every configured MCP server is connected, `503` otherwise; does not require authentication |
 | `GET` | `/v1/models` | Lists configured agents |
 | `POST` | `/v1/chat/completions` | Runs an agent |
 
@@ -113,15 +114,28 @@ strict_requests = false
 
 [[agents]]
 name = "assistant"                # clients use this as the model name
-provider = "openai"               # openai or ollama
+provider = "openai"               # openai, anthropic, or ollama
 model = "gpt-5.5"
+# wire = "chat"                   # openai only: "responses" (default) or "chat" for servers
+#                                 # that only implement /chat/completions (vLLM, LiteLLM, ...)
 preamble = "You are a helpful assistant."
 max_turns = 10                     # model calls per request, including tool follow-ups
+# max_concurrent_requests = 8      # this agent's own cap, within the server-wide one
+# request_timeout_seconds = 60     # this agent's own deadline, within the server-wide one
 
 [[agents.mcp_servers]]
 url = "http://127.0.0.1:9000/mcp"
 # bearer_token_env = "MCP_SEARCH_TOKEN"
 # allowed_tools = ["search", "read"]
+
+# Or run an MCP server as a child process instead of connecting to a URL:
+# [[agents.mcp_servers]]
+# command = "/usr/local/bin/mcp-server-time"
+# args = ["--local-timezone", "UTC"]
+# working_dir = "/var/lib/riggate"
+# env = { LOG_LEVEL = "warn" }      # literal values handed to the child
+# inherit_env = ["HOME"]            # gateway variables copied into the child
+# allowed_tools = ["get_current_time"]
 ```
 
 The top-level request controls default to a 1 MiB body limit, 64 concurrent agent runs, and a
@@ -170,6 +184,8 @@ file.
 | `RIGGATE_API_KEY` | Protect API routes and allow non-loopback binds |
 | `OPENAI_API_KEY` | OpenAI provider credential |
 | `OPENAI_BASE_URL` | OpenAI-compatible endpoint, such as Azure OpenAI or vLLM |
+| `ANTHROPIC_API_KEY` | Anthropic provider credential |
+| `ANTHROPIC_BASE_URL` | Anthropic-compatible endpoint; defaults to the Anthropic API |
 | `OLLAMA_API_BASE_URL` | Ollama endpoint; defaults to `http://localhost:11434` |
 | MCP token variable | The variable named by an MCP server's `bearer_token_env` |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | OTLP log endpoint, when `"otlp"` is in `log_targets` |
@@ -201,8 +217,61 @@ arguments are represented only by their SHA-256 hash. For example:
 {"request_id":"chatcmpl-abc123","client_id":"claims-app","client_name":"Claims application","on_behalf_of":"user-42","agent":"assistant","server":"http://mcp.internal/mcp","tool":"lookup_claim","decision":"allowed","outcome":"ok","error_kind":"","duration_ms":18,"args_sha256":"…","message":"MCP tool audit"}
 ```
 
-MCP endpoints must be reachable from the Riggate host. Riggate currently supports Streamable
-HTTP transport; stdio transport is not implemented.
+### Per-agent limits
+
+An agent may set `max_concurrent_requests` and `request_timeout_seconds` to restrict itself
+further than the server-wide values, so one slow or expensive agent cannot take every slot.
+Both are limits only: a value above the server-wide one is rejected at startup rather than
+silently ignored, and the stricter of the two always applies. A request needs a server-wide slot
+and an agent slot; if either is full it gets `503` with `Retry-After: 1`, and the message says
+which one. Both are held for the whole run, including a stream. An agent without these keys is
+bound only by the server-wide limits.
+
+### Readiness
+
+`/healthz` says the process is alive; `/readyz` says it can do its job. Ready means every
+configured MCP server is currently connected, for stdio servers including after a restart, and
+the answer changes as servers drop and return. The body is
+`{"status":"ready","mcp_servers":{"total":2,"ready":2}}`, with status `503` and `"not_ready"` when
+any are down. When shutdown begins it turns `503` with `"shutting_down"` immediately, before
+in-flight requests have drained, so a load balancer stops sending traffic first. Because the probe is unauthenticated it reports counts only; the log names the
+server that is down. Providers are not probed, since that would spend tokens or depend on the
+network; a provider outage shows up as `502` on requests. An HTTP MCP server whose connection
+closes is not reconnected, so it stays unready until Riggate restarts.
+
+### Stdio MCP servers
+
+Each server sets exactly one of `url` or `command`. A `command` server is a child process of the
+gateway, which makes the config file executable in effect: **it names programs the gateway will
+run with the gateway's privileges.** Give it the review and file permissions you would give code,
+and keep it writable only by the account that administers the gateway.
+
+- **Environment is scrubbed.** The child starts with an empty environment and receives only the
+  literal `env` entries plus the gateway variables named in `inherit_env`. `OPENAI_API_KEY`,
+  `RIGGATE_API_KEY` and client token variables are never passed unless you name them. A name in
+  both `env` and `inherit_env` is rejected. This includes `PATH`: a bare `command` is looked up
+  on the gateway's own `PATH`, but the child does not get one. Launchers that start further
+  programs (`npx`, `uvx`) need `inherit_env = ["PATH"]`; an absolute `command` avoids depending
+  on the gateway's `PATH`.
+- **Readiness.** Riggate waits for the MCP handshake before it starts listening, and refuses to
+  start if a stdio server cannot be spawned or initialised, as it does for HTTP servers.
+- **Supervision.** If a child exits, Riggate restarts it with exponential backoff (1 s doubling
+  to 30 s, reset after a connection stays up for 60 s). While it is down its tools are not
+  offered to the model; they return when it reconnects, under the same `allowed_tools` policy.
+- **stderr** is logged, one event per line, with `agent`, `server` and `stream="stderr"`, so it
+  follows your `log_targets`. Lines longer than 8 KiB are split.
+- **Shutdown.** After in-flight requests drain, each child is stopped in stages: its stdin is
+  closed and it gets 3 s to exit, then it receives SIGTERM and 3 s more, then SIGKILL. Riggate
+  does not exit while a child it started is running.
+- **Process groups.** Each child leads its own process group, and the whole group is sent
+  SIGKILL when the server stops, crashes or fails its handshake. A launcher such as `npx` or
+  `uvx` therefore cannot leave the real server running. Exit is detected from the process
+  itself, not only its pipes, so a grandchild holding stdout open does not hide a crash. This
+  is Unix only; on other platforms only the process Riggate started is stopped.
+- **Config reload** does not exist yet (change the file and restart), so there is no reload
+  path to clean up.
+
+HTTP MCP endpoints must be reachable from the Riggate host.
 
 ## Built with Rig
 

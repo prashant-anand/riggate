@@ -77,6 +77,19 @@ pub enum Provider {
     Openai,
     /// A local Ollama server inside your network.
     Ollama,
+    /// Anthropic Claude, or an Anthropic-compatible endpoint set with `ANTHROPIC_BASE_URL`.
+    Anthropic,
+}
+
+/// Which OpenAI endpoint an `openai` agent talks to.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Wire {
+    /// `POST /responses`, OpenAI's current API. The default.
+    #[default]
+    Responses,
+    /// `POST /chat/completions`, which every OpenAI-compatible server serves.
+    Chat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +99,10 @@ pub struct AgentConfig {
     pub provider: Provider,
     /// Upstream model id, e.g. "gpt-5.5" or "llama3.1:8b".
     pub model: String,
+    /// Which OpenAI endpoint to use; only valid with `provider = "openai"`. Servers such as vLLM
+    /// or LiteLLM usually offer only `chat`.
+    #[serde(default)]
+    pub wire: Option<Wire>,
     /// System prompt.
     #[serde(default)]
     pub preamble: Option<String>,
@@ -95,22 +112,139 @@ pub struct AgentConfig {
     /// MCP servers whose tools should be available to this agent.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Concurrent runs allowed for this agent, in addition to the server-wide
+    /// `max_concurrent_requests`. Cannot exceed it. Unset means only the server-wide limit.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    /// Deadline in seconds for one run of this agent, in addition to the server-wide
+    /// `request_timeout_seconds`. Cannot exceed it. Unset means only the server-wide limit.
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
 }
 
 fn default_max_turns() -> usize {
     10
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct McpServerConfig {
-    /// Streamable HTTP endpoint for the MCP server.
-    pub url: String,
-    /// Environment variable containing a bearer token for this server.
+    /// Streamable HTTP endpoint for the MCP server. Exactly one of `url` or `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Environment variable containing a bearer token for this server (HTTP only).
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// Program to run as a stdio MCP server. Exactly one of `url` or `command`. A bare name
+    /// is looked up on the gateway's own `PATH`; the child does not receive `PATH` unless
+    /// `inherit_env` names it (needed by launchers such as `npx` or `uvx` that start more
+    /// programs). An absolute path avoids depending on the gateway's `PATH` at all.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments for `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working directory for `command`; defaults to the gateway's.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Variables set in the child, as literal values. Nothing else reaches the child except
+    /// what `inherit_env` names.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Names of gateway variables copied into the child. Everything not named here or in
+    /// `env` is withheld, so provider and gateway keys never leak by default.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
     /// If set, only these discovered tool names are registered.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Seconds between liveness checks of a `url` server; `0` turns them off. Default 15.
+    /// A server that vanishes is noticed after roughly twice this plus the timeout.
+    #[serde(default)]
+    pub heartbeat_interval_seconds: Option<u64>,
+    /// Seconds a liveness check may take before it counts as failed. Default 5.
+    #[serde(default)]
+    pub heartbeat_timeout_seconds: Option<u64>,
+}
+
+impl McpServerConfig {
+    /// Human-readable identity used in logs and errors: the URL, or `stdio:<command>`.
+    pub fn display_name(&self) -> String {
+        match (&self.url, &self.command) {
+            (Some(url), _) => url.clone(),
+            (None, Some(command)) => format!("stdio:{command}"),
+            (None, None) => "<unconfigured>".to_string(),
+        }
+    }
+
+    fn validate(&self, agent: &str) -> Result<()> {
+        match (&self.url, &self.command) {
+            (Some(_), Some(_)) => bail!(
+                "agent '{agent}' has an MCP server with both url and command; set exactly one"
+            ),
+            (None, None) => bail!(
+                "agent '{agent}' has an MCP server with neither url nor command; set exactly one"
+            ),
+            (Some(url), None) => {
+                if url.trim().is_empty() {
+                    bail!("agent '{agent}' has an MCP server with an empty url");
+                }
+                if self.heartbeat_timeout_seconds == Some(0) {
+                    bail!(
+                        "agent '{agent}' has an MCP server with heartbeat_timeout_seconds = 0; use heartbeat_interval_seconds = 0 to turn checks off"
+                    );
+                }
+                if self.has_stdio_fields() {
+                    bail!(
+                        "agent '{agent}' sets args, working_dir, env or inherit_env on a url MCP server; those only apply to command"
+                    );
+                }
+            }
+            (None, Some(command)) => {
+                if command.trim().is_empty() {
+                    bail!("agent '{agent}' has an MCP server with an empty command");
+                }
+                if self.heartbeat_interval_seconds.is_some()
+                    || self.heartbeat_timeout_seconds.is_some()
+                {
+                    bail!(
+                        "agent '{agent}' sets a heartbeat on a command MCP server; a child's exit is detected directly, so heartbeats only apply to url"
+                    );
+                }
+                if self.bearer_token_env.is_some() {
+                    bail!(
+                        "agent '{agent}' sets bearer_token_env on a command MCP server; it only applies to url"
+                    );
+                }
+                if self
+                    .working_dir
+                    .as_deref()
+                    .is_some_and(|dir| dir.trim().is_empty())
+                {
+                    bail!("agent '{agent}' has an MCP server with an empty working_dir");
+                }
+                for name in self.env.keys().chain(self.inherit_env.iter()) {
+                    if name.trim().is_empty() || name.contains('=') || name.contains('\0') {
+                        bail!(
+                            "agent '{agent}' has an MCP server with an invalid environment variable name {name:?}"
+                        );
+                    }
+                }
+                if let Some(name) = self.inherit_env.iter().find(|n| self.env.contains_key(*n)) {
+                    bail!(
+                        "agent '{agent}' names {name} in both env and inherit_env; choose one source"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_stdio_fields(&self) -> bool {
+        !self.args.is_empty()
+            || self.working_dir.is_some()
+            || !self.env.is_empty()
+            || !self.inherit_env.is_empty()
+    }
 }
 
 impl Config {
@@ -156,10 +290,46 @@ impl Config {
             if a.max_turns == 0 {
                 bail!("agent '{}' max_turns must be greater than zero", a.name);
             }
-            for server in &a.mcp_servers {
-                if server.url.trim().is_empty() {
-                    bail!("agent '{}' has an MCP server with an empty url", a.name);
+            // An agent limit is a further restriction. One above the server-wide value would
+            // never take effect, and silently ignoring a configured number hides a mistake.
+            if let Some(limit) = a.max_concurrent_requests {
+                if limit == 0 {
+                    bail!(
+                        "agent '{}' max_concurrent_requests must be greater than zero",
+                        a.name
+                    );
                 }
+                if limit > cfg.max_concurrent_requests {
+                    bail!(
+                        "agent '{}' max_concurrent_requests ({limit}) exceeds the server-wide limit ({}); it can only lower it",
+                        a.name,
+                        cfg.max_concurrent_requests
+                    );
+                }
+            }
+            if let Some(seconds) = a.request_timeout_seconds {
+                if seconds == 0 {
+                    bail!(
+                        "agent '{}' request_timeout_seconds must be greater than zero",
+                        a.name
+                    );
+                }
+                if seconds > cfg.request_timeout_seconds {
+                    bail!(
+                        "agent '{}' request_timeout_seconds ({seconds}) exceeds the server-wide timeout ({}); it can only lower it",
+                        a.name,
+                        cfg.request_timeout_seconds
+                    );
+                }
+            }
+            if a.wire.is_some() && a.provider != Provider::Openai {
+                bail!(
+                    "agent '{}' sets wire, which only applies to provider = \"openai\"",
+                    a.name
+                );
+            }
+            for server in &a.mcp_servers {
+                server.validate(&a.name)?;
                 if server
                     .bearer_token_env
                     .as_deref()
@@ -304,6 +474,42 @@ preamble = "Be brief."
     }
 
     #[test]
+    fn accepts_the_anthropic_provider() {
+        let cfg = Config::parse(
+            "[[agents]]\nname=\"a\"\nprovider=\"anthropic\"\nmodel=\"claude-sonnet-5-5\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.agents[0].provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn wire_defaults_to_unset_and_accepts_chat_and_responses() {
+        let base = "[[agents]]\nname=\"a\"\nprovider=\"openai\"\nmodel=\"m\"\n";
+        assert_eq!(Config::parse(base).unwrap().agents[0].wire, None);
+        for (value, expected) in [("chat", Wire::Chat), ("responses", Wire::Responses)] {
+            let cfg = Config::parse(&format!("{base}wire=\"{value}\"\n")).unwrap();
+            assert_eq!(cfg.agents[0].wire, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_wire() {
+        let raw = "[[agents]]\nname=\"a\"\nprovider=\"openai\"\nmodel=\"m\"\nwire=\"soap\"\n";
+        assert!(Config::parse(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_wire_on_a_provider_that_has_no_such_choice() {
+        for provider in ["ollama", "anthropic"] {
+            let raw = format!(
+                "[[agents]]\nname=\"a\"\nprovider=\"{provider}\"\nmodel=\"m\"\nwire=\"chat\"\n"
+            );
+            let err = Config::parse(&raw).unwrap_err().to_string();
+            assert!(err.contains("wire"), "{err}");
+        }
+    }
+
+    #[test]
     fn rejects_unknown_provider() {
         assert!(
             Config::parse("[[agents]]\nname=\"a\"\nprovider=\"gemini\"\nmodel=\"m\"\n").is_err()
@@ -436,5 +642,110 @@ preamble = "Be brief."
             .unwrap_err()
             .to_string()
             .contains("mixes"));
+    }
+
+    fn mcp(body: &str) -> String {
+        format!("[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n[[agents.mcp_servers]]\n{body}\n")
+    }
+
+    #[test]
+    fn accepts_stdio_mcp_server() {
+        let cfg = Config::parse(&mcp(
+            "command=\"/usr/bin/x\"\nargs=[\"--a\"]\nworking_dir=\"/tmp\"\ninherit_env=[\"HOME\"]\nenv={TZ=\"UTC\"}\nallowed_tools=[\"t\"]",
+        ))
+        .unwrap();
+        let s = &cfg.agents[0].mcp_servers[0];
+        assert_eq!(s.display_name(), "stdio:/usr/bin/x");
+        assert_eq!(s.env["TZ"], "UTC");
+    }
+
+    #[test]
+    fn rejects_bad_mcp_transport_combinations() {
+        for (body, want) in [
+            ("url=\"http://x\"\ncommand=\"y\"", "both url and command"),
+            ("allowed_tools=[\"t\"]", "neither url nor command"),
+            ("command=\" \"", "empty command"),
+            ("url=\"http://x\"\nargs=[\"a\"]", "only apply to command"),
+            (
+                "url=\"http://x\"\ninherit_env=[\"A\"]",
+                "only apply to command",
+            ),
+            (
+                "command=\"y\"\nbearer_token_env=\"T\"",
+                "only applies to url",
+            ),
+            (
+                "command=\"y\"\nenv={\"A=B\"=\"1\"}",
+                "invalid environment variable name",
+            ),
+            (
+                "command=\"y\"\ninherit_env=[\"\"]",
+                "invalid environment variable name",
+            ),
+            (
+                "command=\"y\"\nenv={A=\"1\"}\ninherit_env=[\"A\"]",
+                "both env and inherit_env",
+            ),
+            ("command=\"y\"\nworking_dir=\" \"", "empty working_dir"),
+        ] {
+            let err = Config::parse(&mcp(body)).unwrap_err().to_string();
+            assert!(err.contains(want), "{body}: got {err}");
+        }
+    }
+
+    #[test]
+    fn agent_limits_parse_and_must_only_lower_the_server_wide_ones() {
+        let base = "max_concurrent_requests=4\nrequest_timeout_seconds=30\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        let ok = Config::parse(&format!(
+            "{base}max_concurrent_requests=2\nrequest_timeout_seconds=10\n"
+        ))
+        .unwrap();
+        assert_eq!(ok.agents[0].max_concurrent_requests, Some(2));
+        assert_eq!(ok.agents[0].request_timeout_seconds, Some(10));
+        let unset = Config::parse(base).unwrap();
+        assert_eq!(unset.agents[0].max_concurrent_requests, None);
+        // Equal to the server-wide value is allowed.
+        Config::parse(&format!("{base}max_concurrent_requests=4\n")).unwrap();
+
+        for (extra, want) in [
+            ("max_concurrent_requests=0", "must be greater than zero"),
+            ("max_concurrent_requests=5", "exceeds the server-wide limit"),
+            ("request_timeout_seconds=0", "must be greater than zero"),
+            (
+                "request_timeout_seconds=31",
+                "exceeds the server-wide timeout",
+            ),
+        ] {
+            let err = Config::parse(&format!("{base}{extra}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{extra}: got {err}");
+        }
+    }
+
+    #[test]
+    fn heartbeat_settings_apply_to_url_servers_only_and_zero_means_off() {
+        let url = |extra: &str| mcp(&format!("url=\"http://x\"\n{extra}"));
+        let cfg = Config::parse(&url("heartbeat_interval_seconds=0")).unwrap();
+        assert_eq!(
+            cfg.agents[0].mcp_servers[0].heartbeat_interval_seconds,
+            Some(0)
+        );
+        let cfg = Config::parse(&url(
+            "heartbeat_interval_seconds=5\nheartbeat_timeout_seconds=2",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.agents[0].mcp_servers[0].heartbeat_timeout_seconds,
+            Some(2)
+        );
+        let err = Config::parse(&url("heartbeat_timeout_seconds=0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("heartbeat_timeout_seconds = 0"), "{err}");
+        let err = Config::parse(&mcp("command=\"y\"\nheartbeat_interval_seconds=5"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only apply to url"), "{err}");
     }
 }

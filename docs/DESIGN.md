@@ -27,7 +27,8 @@ Cost: we inherit a specification we do not control, including fields we ignore.
 ## Providers configured by environment, not by file
 
 API keys never belong in a config file that gets committed. `rig`'s clients read
-`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OLLAMA_API_BASE_URL` directly, so the config file
+`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` /
+`OLLAMA_API_BASE_URL` directly, so the config file
 holds only names, models, and prompts.
 
 ## Errors carry meaning
@@ -54,7 +55,7 @@ the text chunks.
 
 ## Tools come from MCP servers
 
-An agent may configure Streamable HTTP MCP endpoints. At startup Riggate connects each
+An agent may configure Streamable HTTP MCP endpoints or stdio child processes (see the README for the trust and supervision model). At startup Riggate connects each
 endpoint, registers its tools with Rig, and holds the connection for the agent's lifetime.
 `max_turns` bounds the model calls made by a request, including tool follow-ups. This makes
 tools configurable without compiling tool implementations into the server binary.
