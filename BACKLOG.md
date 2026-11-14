@@ -32,4 +32,4 @@ Today only Streamable HTTP is supported. The transport itself is not the work: r
 - [x] Apply the same tool policy to both transports: `allowed_tools` filtering and the tool-policy log lines must not depend on how the server is reached.
 - [x] Test stdio against a fake MCP child process, not only the HTTP mock provider.
 - [x] Document the security consequence: the config file names programs to execute, so it needs the review and file permissions that code gets.
-- [ ] Stop stdio children gracefully (SIGTERM, then SIGKILL after a delay) and kill the whole process group, so a launcher such as `npx` cannot leave grandchildren behind. Today the child is killed once its stdin is closed.
+- [x] Stop stdio children in stages (stdin close, SIGTERM, SIGKILL) and kill the whole process group, so launchers cannot leave grandchildren behind.

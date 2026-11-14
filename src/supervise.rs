@@ -5,7 +5,6 @@
 //! shutdown) is testable without spawning anything.
 
 use anyhow::Result;
-use rig::tool::rmcp::McpConnection;
 use std::future::Future;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -47,10 +46,19 @@ async fn stopped(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
+/// One live connection to a server, plus whatever process backs it.
+pub trait Session {
+    /// Resolves when the server is gone: connection closed or process exited.
+    fn closed(&mut self) -> impl Future<Output = ()> + Send;
+    /// Tear everything down and wait for it. Also called after the server died on its own,
+    /// to sweep up what it left behind.
+    fn stop(self) -> impl Future<Output = ()> + Send;
+}
+
 /// Run until shutdown. `first` receives the outcome of the very first connect so boot can
 /// refuse to serve with a server that never came up, matching the HTTP transport. Failures
 /// after that are logged and retried.
-pub async fn supervise<F, Fut>(
+pub async fn supervise<S, F, Fut>(
     agent: String,
     server: String,
     mut connect: F,
@@ -58,34 +66,37 @@ pub async fn supervise<F, Fut>(
     first: oneshot::Sender<Result<()>>,
     backoff: Backoff,
 ) where
+    S: Session,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<McpConnection>>,
+    Fut: Future<Output = Result<S>>,
 {
     let mut first = Some(first);
     let mut attempt: u32 = 0;
     loop {
         let started = std::time::Instant::now();
         match connect().await {
-            Ok(connection) => {
+            Ok(mut session) => {
                 if let Some(tx) = first.take() {
                     let _ = tx.send(Ok(()));
                 }
                 tracing::info!(agent = %agent, server = %server, "stdio MCP server ready");
-                tokio::select! {
-                    _ = connection.closed() => {
+                let shutting_down = tokio::select! {
+                    _ = session.closed() => {
                         tracing::warn!(agent = %agent, server = %server, uptime_ms = started.elapsed().as_millis() as u64, "stdio MCP server exited; restarting");
+                        false
                     }
-                    _ = stopped(&mut shutdown) => {
-                        connection.close().await;
-                        tracing::info!(agent = %agent, server = %server, "stdio MCP server stopped");
-                        return;
-                    }
+                    _ = stopped(&mut shutdown) => true,
+                };
+                // Dropping the connection retires its tools before the next ones register,
+                // and the sweep kills anything the dead server left running.
+                session.stop().await;
+                if shutting_down {
+                    tracing::info!(agent = %agent, server = %server, "stdio MCP server stopped");
+                    return;
                 }
                 if started.elapsed() >= backoff.healthy_after {
                     attempt = 0;
                 }
-                // Dropping the dead connection retires its tools before the new ones register.
-                drop(connection);
             }
             Err(error) => {
                 if let Some(tx) = first.take() {
@@ -156,6 +167,12 @@ mod tests {
         assert_eq!(b.delay(u32::MAX), Duration::from_secs(10));
     }
 
+    struct NeverUp;
+    impl Session for NeverUp {
+        async fn closed(&mut self) {}
+        async fn stop(self) {}
+    }
+
     #[tokio::test]
     async fn first_connect_failure_is_reported_and_not_retried() {
         let (_stop_tx, stop_rx) = watch::channel(false);
@@ -167,7 +184,7 @@ mod tests {
             "s".into(),
             move || {
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err(anyhow::anyhow!("boom")) }
+                async { Err::<NeverUp, _>(anyhow::anyhow!("boom")) }
             },
             stop_rx,
             tx,

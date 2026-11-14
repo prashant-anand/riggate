@@ -236,10 +236,14 @@ and keep it writable only by the account that administers the gateway.
   offered to the model; they return when it reconnects, under the same `allowed_tools` policy.
 - **stderr** is logged, one event per line, with `agent`, `server` and `stream="stderr"`, so it
   follows your `log_targets`. Lines longer than 8 KiB are split.
-- **Shutdown.** After in-flight requests drain, the child's stdin is closed and it is killed;
-  Riggate does not exit while a supervised child it started is running. A child that is
-  itself a launcher can leave its own children behind: only the process Riggate started is
-  tracked.
+- **Shutdown.** After in-flight requests drain, each child is stopped in stages: its stdin is
+  closed and it gets 3 s to exit, then it receives SIGTERM and 3 s more, then SIGKILL. Riggate
+  does not exit while a child it started is running.
+- **Process groups.** Each child leads its own process group, and the whole group is sent
+  SIGKILL when the server stops, crashes or fails its handshake. A launcher such as `npx` or
+  `uvx` therefore cannot leave the real server running. Exit is detected from the process
+  itself, not only its pipes, so a grandchild holding stdout open does not hide a crash. This
+  is Unix only; on other platforms only the process Riggate started is stopped.
 - **Config reload** does not exist yet (change the file and restart), so there is no reload
   path to clean up.
 

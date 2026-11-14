@@ -313,35 +313,65 @@ async fn connect_mcp(
     Ok(Box::new(connection))
 }
 
+/// A running stdio server: the MCP connection and the process behind it.
+struct StdioSession {
+    connection: Option<rig::tool::rmcp::McpConnection>,
+    process: crate::child::ServerProcess,
+}
+
+impl crate::supervise::Session for StdioSession {
+    async fn closed(&mut self) {
+        let connection = self.connection.as_ref().expect("connection until stop");
+        // Either end ending counts. The process can die while a grandchild still holds the
+        // pipe open, in which case the connection alone would never report it.
+        tokio::select! {
+            _ = connection.closed() => {}
+            _ = self.process.exited() => {}
+        }
+    }
+
+    async fn stop(mut self) {
+        if let Some(connection) = self.connection.take() {
+            // Closing drops our end of stdin, which is the polite request to exit.
+            connection.close().await;
+        }
+        self.process.stop().await;
+    }
+}
+
 /// Spawn the child once and complete the MCP handshake. Called again by the supervisor
 /// after every exit, so it builds everything it needs fresh: a command, a handler, a pipe.
 async fn connect_stdio_once(
     server: &McpServerConfig,
     tool_server: &rig::tool::server::ToolServerHandle,
     agent: &str,
-) -> Result<rig::tool::rmcp::McpConnection> {
-    use rig::tool::rmcp::rmcp::transport::TokioChildProcess;
-
+) -> Result<StdioSession> {
     let name = server.display_name();
-    let mut command = stdio_command(server, |var| std::env::var(var).ok());
-    // Backstop: if the transport is dropped on any path, the child gets SIGKILL
-    // synchronously rather than depending on a task that may never run at shutdown.
-    command.kill_on_drop(true);
-    let (transport, stderr) = TokioChildProcess::builder(command)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    let command = stdio_command(server, |var| std::env::var(var).ok());
+    let spawned = crate::child::ServerProcess::spawn(command)
         .with_context(|| format!("spawning MCP server {name}"))?;
-    if let Some(stderr) = stderr {
+    let mut process = spawned.process;
+    if let Some(stderr) = spawned.stderr {
         tokio::spawn(crate::supervise::forward_stderr(
             stderr,
             agent.to_string(),
             name.clone(),
         ));
     }
-    mcp_handler(server, tool_server, agent)
-        .connect(transport)
+    match mcp_handler(server, tool_server, agent)
+        .connect((spawned.stdout, spawned.stdin))
         .await
-        .with_context(|| format!("MCP connection to {name} failed"))
+    {
+        Ok(connection) => Ok(StdioSession {
+            connection: Some(connection),
+            process,
+        }),
+        Err(error) => {
+            // The handshake failed; do not leave the child (or its children) behind.
+            process.stop().await;
+            Err(anyhow::Error::from(error).context(format!("MCP connection to {name} failed")))
+        }
+    }
 }
 
 /// Start supervising a stdio server and wait for its first handshake, so the gateway does
@@ -886,6 +916,17 @@ import json, os, sys
 with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(str(os.getpid()) + "\n")
 sys.stderr.write("fake server booted\n"); sys.stderr.flush()
+import signal, subprocess
+if os.environ.get("FAKE_GRANDCHILD"):
+    gc = subprocess.Popen(["sleep", "300"])
+    with open(os.environ["FAKE_GRANDCHILD"], "w") as f:
+        f.write(str(gc.pid))
+if os.environ.get("FAKE_STUBBORN"):
+    # Serves normally, but once stdin closes it keeps running until SIGTERM, which it records.
+    def term(*_):
+        open(os.environ["FAKE_STUBBORN"], "w").close()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, term)
 crash = os.environ.get("FAKE_CRASH_ONCE")
 first = not os.path.exists(crash) if crash else False
 for line in sys.stdin:
@@ -907,6 +948,10 @@ for line in sys.stdin:
     if method == "tools/list" and first:
         open(crash, "w").close()
         os._exit(1)
+if os.environ.get("FAKE_STUBBORN"):
+    import time
+    while True:
+        time.sleep(0.1)
 "#;
 
     struct Fake {
@@ -1044,5 +1089,85 @@ for line in sys.stdin:
             format!("{err:#}").contains("spawning MCP server"),
             "{err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_ignores_stdin_eof_is_sent_sigterm_before_being_killed() {
+        let mut f = fake("sigterm", false);
+        let marker = f.dir.join("got-sigterm");
+        f.server
+            .env
+            .insert("FAKE_STUBBORN".into(), marker.display().to_string());
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+            .await
+            .unwrap();
+        let pid = starts(&f.dir)[0];
+        let started = std::time::Instant::now();
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        assert!(
+            marker.exists(),
+            "the child should have been asked to stop with SIGTERM"
+        );
+        wait_for("child to be reaped", || !pid_alive(pid)).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn grandchildren_do_not_outlive_the_server() {
+        let mut f = fake("group", false);
+        let gc_file = f.dir.join("grandchild");
+        f.server
+            .env
+            .insert("FAKE_GRANDCHILD".into(), gc_file.display().to_string());
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+            .await
+            .unwrap();
+        let gc: u32 = std::fs::read_to_string(&gc_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            pid_alive(gc),
+            "the grandchild should be running while the server is up"
+        );
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        wait_for("grandchild to be reaped", || !pid_alive(gc)).await;
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn grandchildren_of_a_crashed_server_are_cleaned_up_before_the_restart() {
+        let mut f = fake("group-crash", true);
+        let gc_file = f.dir.join("grandchild");
+        f.server
+            .env
+            .insert("FAKE_GRANDCHILD".into(), gc_file.display().to_string());
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+            .await
+            .unwrap();
+        let first_gc: u32 = std::fs::read_to_string(&gc_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        wait_for("a second start", || starts(&f.dir).len() >= 2).await;
+        wait_for("the first grandchild to be reaped", || !pid_alive(first_gc)).await;
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 }

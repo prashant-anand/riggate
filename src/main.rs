@@ -1,5 +1,6 @@
 mod agent;
 mod auth;
+mod child;
 mod config;
 mod routes;
 mod supervise;
