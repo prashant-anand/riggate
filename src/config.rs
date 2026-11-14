@@ -112,13 +112,21 @@ pub struct AgentConfig {
     /// MCP servers whose tools should be available to this agent.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Concurrent runs allowed for this agent, in addition to the server-wide
+    /// `max_concurrent_requests`. Cannot exceed it. Unset means only the server-wide limit.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    /// Deadline in seconds for one run of this agent, in addition to the server-wide
+    /// `request_timeout_seconds`. Cannot exceed it. Unset means only the server-wide limit.
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
 }
 
 fn default_max_turns() -> usize {
     10
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct McpServerConfig {
     /// Streamable HTTP endpoint for the MCP server. Exactly one of `url` or `command`.
     #[serde(default)]
@@ -149,6 +157,13 @@ pub struct McpServerConfig {
     /// If set, only these discovered tool names are registered.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Seconds between liveness checks of a `url` server; `0` turns them off. Default 15.
+    /// A server that vanishes is noticed after roughly twice this plus the timeout.
+    #[serde(default)]
+    pub heartbeat_interval_seconds: Option<u64>,
+    /// Seconds a liveness check may take before it counts as failed. Default 5.
+    #[serde(default)]
+    pub heartbeat_timeout_seconds: Option<u64>,
 }
 
 impl McpServerConfig {
@@ -173,6 +188,11 @@ impl McpServerConfig {
                 if url.trim().is_empty() {
                     bail!("agent '{agent}' has an MCP server with an empty url");
                 }
+                if self.heartbeat_timeout_seconds == Some(0) {
+                    bail!(
+                        "agent '{agent}' has an MCP server with heartbeat_timeout_seconds = 0; use heartbeat_interval_seconds = 0 to turn checks off"
+                    );
+                }
                 if self.has_stdio_fields() {
                     bail!(
                         "agent '{agent}' sets args, working_dir, env or inherit_env on a url MCP server; those only apply to command"
@@ -182,6 +202,13 @@ impl McpServerConfig {
             (None, Some(command)) => {
                 if command.trim().is_empty() {
                     bail!("agent '{agent}' has an MCP server with an empty command");
+                }
+                if self.heartbeat_interval_seconds.is_some()
+                    || self.heartbeat_timeout_seconds.is_some()
+                {
+                    bail!(
+                        "agent '{agent}' sets a heartbeat on a command MCP server; a child's exit is detected directly, so heartbeats only apply to url"
+                    );
                 }
                 if self.bearer_token_env.is_some() {
                     bail!(
@@ -262,6 +289,38 @@ impl Config {
             }
             if a.max_turns == 0 {
                 bail!("agent '{}' max_turns must be greater than zero", a.name);
+            }
+            // An agent limit is a further restriction. One above the server-wide value would
+            // never take effect, and silently ignoring a configured number hides a mistake.
+            if let Some(limit) = a.max_concurrent_requests {
+                if limit == 0 {
+                    bail!(
+                        "agent '{}' max_concurrent_requests must be greater than zero",
+                        a.name
+                    );
+                }
+                if limit > cfg.max_concurrent_requests {
+                    bail!(
+                        "agent '{}' max_concurrent_requests ({limit}) exceeds the server-wide limit ({}); it can only lower it",
+                        a.name,
+                        cfg.max_concurrent_requests
+                    );
+                }
+            }
+            if let Some(seconds) = a.request_timeout_seconds {
+                if seconds == 0 {
+                    bail!(
+                        "agent '{}' request_timeout_seconds must be greater than zero",
+                        a.name
+                    );
+                }
+                if seconds > cfg.request_timeout_seconds {
+                    bail!(
+                        "agent '{}' request_timeout_seconds ({seconds}) exceeds the server-wide timeout ({}); it can only lower it",
+                        a.name,
+                        cfg.request_timeout_seconds
+                    );
+                }
             }
             if a.wire.is_some() && a.provider != Provider::Openai {
                 bail!(
@@ -632,5 +691,61 @@ preamble = "Be brief."
             let err = Config::parse(&mcp(body)).unwrap_err().to_string();
             assert!(err.contains(want), "{body}: got {err}");
         }
+    }
+
+    #[test]
+    fn agent_limits_parse_and_must_only_lower_the_server_wide_ones() {
+        let base = "max_concurrent_requests=4\nrequest_timeout_seconds=30\n[[agents]]\nname=\"a\"\nprovider=\"ollama\"\nmodel=\"m\"\n";
+        let ok = Config::parse(&format!(
+            "{base}max_concurrent_requests=2\nrequest_timeout_seconds=10\n"
+        ))
+        .unwrap();
+        assert_eq!(ok.agents[0].max_concurrent_requests, Some(2));
+        assert_eq!(ok.agents[0].request_timeout_seconds, Some(10));
+        let unset = Config::parse(base).unwrap();
+        assert_eq!(unset.agents[0].max_concurrent_requests, None);
+        // Equal to the server-wide value is allowed.
+        Config::parse(&format!("{base}max_concurrent_requests=4\n")).unwrap();
+
+        for (extra, want) in [
+            ("max_concurrent_requests=0", "must be greater than zero"),
+            ("max_concurrent_requests=5", "exceeds the server-wide limit"),
+            ("request_timeout_seconds=0", "must be greater than zero"),
+            (
+                "request_timeout_seconds=31",
+                "exceeds the server-wide timeout",
+            ),
+        ] {
+            let err = Config::parse(&format!("{base}{extra}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{extra}: got {err}");
+        }
+    }
+
+    #[test]
+    fn heartbeat_settings_apply_to_url_servers_only_and_zero_means_off() {
+        let url = |extra: &str| mcp(&format!("url=\"http://x\"\n{extra}"));
+        let cfg = Config::parse(&url("heartbeat_interval_seconds=0")).unwrap();
+        assert_eq!(
+            cfg.agents[0].mcp_servers[0].heartbeat_interval_seconds,
+            Some(0)
+        );
+        let cfg = Config::parse(&url(
+            "heartbeat_interval_seconds=5\nheartbeat_timeout_seconds=2",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.agents[0].mcp_servers[0].heartbeat_timeout_seconds,
+            Some(2)
+        );
+        let err = Config::parse(&url("heartbeat_timeout_seconds=0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("heartbeat_timeout_seconds = 0"), "{err}");
+        let err = Config::parse(&mcp("command=\"y\"\nheartbeat_interval_seconds=5"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only apply to url"), "{err}");
     }
 }

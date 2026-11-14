@@ -473,17 +473,39 @@ async fn chat_inner(
     })?;
 
     let (prompt, history) = conversation(req.messages)?;
-    let permit = match control.semaphore.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "1")],
-                Json(json!({"error": {"message": "server is at its concurrent request limit; retry later", "type": "riggate_error"}})),
-            )
-                .into_response())
-        }
+    let at_limit = |message: &str| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            Json(json!({"error": {"message": message, "type": "riggate_error"}})),
+        )
+            .into_response()
     };
+    // The server-wide permit first, then the agent's own. Both are held for the whole run
+    // (including a stream) and released together; either one being full rejects the request.
+    let Ok(server_permit) = control.semaphore.clone().try_acquire_owned() else {
+        return Ok(at_limit(
+            "server is at its concurrent request limit; retry later",
+        ));
+    };
+    let agent_limits = state.agents.limits(&req.model);
+    let agent_permit = match &agent_limits.semaphore {
+        Some(semaphore) => match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return Ok(at_limit(&format!(
+                    "agent '{}' is at its concurrent request limit; retry later",
+                    req.model
+                )))
+            }
+        },
+        None => None,
+    };
+    let permit = (server_permit, agent_permit);
+    // An agent deadline can only shorten the server-wide one.
+    let timeout = agent_limits
+        .timeout
+        .map_or(control.timeout, |own| own.min(control.timeout));
     let mut runner = agent.prompt(prompt).history(history);
     if let Some(temperature) = req.temperature {
         runner = runner.temperature(temperature);
@@ -513,7 +535,6 @@ async fn chat_inner(
         let model = req.model.clone();
         let max_tokens = req.max_tokens.or(req.max_completion_tokens);
         let run = runner.stream();
-        let timeout = control.timeout;
         let span = tracing::Span::current();
         let completion_guard =
             RequestCompletionGuard::new(span.clone(), started, Arc::clone(&outcome));
@@ -632,7 +653,7 @@ async fn chat_inner(
     }
 
     match tokio::time::timeout(
-        control.timeout,
+        timeout,
         crate::agent::with_audit_context(
             audit_context,
             std::future::IntoFuture::into_future(runner),
@@ -1543,6 +1564,134 @@ mod tests {
         server.abort();
     }
 
+    /// A provider that answers after `delay`, plus a signal for when a request reached it.
+    async fn slow_provider(
+        delay: Duration,
+    ) -> (
+        String,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let slow = post(move || {
+            let signal = signal.clone();
+            async move {
+                signal.notify_one();
+                tokio::time::sleep(delay).await;
+                Json(json!({
+                    "id": "slow",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "mock-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "answer"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }))
+            }
+        });
+        let provider = Router::new()
+            .route("/v1/chat/completions", slow.clone())
+            .route("/chat/completions", slow);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        (format!("http://{address}/v1"), started, task)
+    }
+
+    #[tokio::test]
+    async fn an_agent_limit_rejects_while_the_server_still_has_room_and_names_the_agent() {
+        let (url, started, server) = slow_provider(Duration::from_millis(150)).await;
+        let registry = crate::agent::test_registry_with_limits(&url, Some(1), None);
+        // Server-wide limit is generous: only the agent's own limit can be what rejects.
+        let app = router(
+            registry,
+            None,
+            RequestLimits {
+                max_concurrent_requests: 8,
+                timeout: Duration::from_secs(2),
+                ..RequestLimits::default()
+            },
+        );
+        let first = tokio::spawn(app.clone().oneshot(chat_request()));
+        started.notified().await;
+
+        let second = app.clone().oneshot(chat_request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second.headers()[header::RETRY_AFTER], "1");
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("agent 'mock'"), "{message}");
+
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+        // Both permits came back: the agent can run again.
+        let third = app.oneshot(chat_request()).await.unwrap();
+        assert_eq!(third.status(), StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rejection_by_the_agent_limit_does_not_leak_a_server_permit() {
+        let (url, started, server) = slow_provider(Duration::from_millis(150)).await;
+        let registry = crate::agent::test_registry_with_limits(&url, Some(1), None);
+        // Room for exactly two server-wide runs. If the rejected request kept its server
+        // permit, the later ones could not both be admitted.
+        let app = router(
+            registry,
+            None,
+            RequestLimits {
+                max_concurrent_requests: 2,
+                timeout: Duration::from_secs(2),
+                ..RequestLimits::default()
+            },
+        );
+        let first = tokio::spawn(app.clone().oneshot(chat_request()));
+        started.notified().await;
+        for _ in 0..5 {
+            let rejected = app.clone().oneshot(chat_request()).await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_agent_deadline_shortens_the_server_one_but_cannot_extend_it() {
+        let (url, _started, server) = slow_provider(Duration::from_millis(200)).await;
+        // Agent deadline 20 ms under a 2 s server deadline: the agent's wins.
+        let tight =
+            crate::agent::test_registry_with_limits(&url, None, Some(Duration::from_millis(20)));
+        let app = router(
+            tight,
+            None,
+            RequestLimits {
+                timeout: Duration::from_secs(2),
+                ..RequestLimits::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let response = app.oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // Agent deadline of 5 s under a 20 ms server deadline: the server's still applies.
+        let loose =
+            crate::agent::test_registry_with_limits(&url, None, Some(Duration::from_secs(5)));
+        let app = router(
+            loose,
+            None,
+            RequestLimits {
+                timeout: Duration::from_millis(20),
+                ..RequestLimits::default()
+            },
+        );
+        let response = app.oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        server.abort();
+    }
+
     fn chat_request() -> Request<Body> {
         Request::post("/v1/chat/completions")
             .header("content-type", "application/json")
@@ -1581,6 +1730,81 @@ mod tests {
             ),
             server,
         )
+    }
+
+    async fn stream_router_with_limits(
+        max_concurrent: Option<usize>,
+        agent_timeout: Option<Duration>,
+        server_timeout: Duration,
+    ) -> (Router, tokio::task::JoinHandle<()>) {
+        let provider = Router::new()
+            .route("/v1/chat/completions", post(slow_stream_response))
+            .route("/chat/completions", post(slow_stream_response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let registry = crate::agent::test_registry_with_limits(
+            &format!("http://{address}/v1"),
+            max_concurrent,
+            agent_timeout,
+        );
+        let app = router(
+            registry,
+            None,
+            RequestLimits {
+                max_concurrent_requests: 8,
+                timeout: server_timeout,
+                ..RequestLimits::default()
+            },
+        );
+        (app, server)
+    }
+
+    #[tokio::test]
+    async fn an_open_stream_holds_the_agent_slot_until_the_client_goes_away() {
+        let (app, server) = stream_router_with_limits(Some(1), None, Duration::from_secs(30)).await;
+        let first = app.clone().oneshot(stream_request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let mut body = first.into_body().into_data_stream();
+        body.next().await.expect("the stream is flowing").unwrap();
+
+        // The stream is still open, so the agent's only slot is taken.
+        let blocked = app.clone().oneshot(stream_request()).await.unwrap();
+        assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(body);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let retry = app.clone().oneshot(stream_request()).await.unwrap();
+            if retry.status() == StatusCode::OK {
+                server.abort();
+                return;
+            }
+        }
+        panic!("the agent slot was never released after the client dropped the stream");
+    }
+
+    #[tokio::test]
+    async fn a_stream_ends_at_the_agent_deadline_when_it_is_shorter_than_the_servers() {
+        let (app, server) = stream_router_with_limits(
+            None,
+            Some(Duration::from_millis(200)),
+            Duration::from_secs(30),
+        )
+        .await;
+        let response = app.oneshot(stream_request()).await.unwrap();
+        let outcome = outcome_handle(&response);
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the agent deadline must end the stream long before the 30 s server one")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream request timed out"));
+        assert_eq!(outcome.outcome(), StreamOutcome::TimedOut);
+        server.abort();
     }
 
     fn stream_request() -> Request<Body> {

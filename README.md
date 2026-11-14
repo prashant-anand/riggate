@@ -120,6 +120,8 @@ model = "gpt-5.5"
 #                                 # that only implement /chat/completions (vLLM, LiteLLM, ...)
 preamble = "You are a helpful assistant."
 max_turns = 10                     # model calls per request, including tool follow-ups
+# max_concurrent_requests = 8      # this agent's own cap, within the server-wide one
+# request_timeout_seconds = 60     # this agent's own deadline, within the server-wide one
 
 [[agents.mcp_servers]]
 url = "http://127.0.0.1:9000/mcp"
@@ -214,6 +216,16 @@ arguments are represented only by their SHA-256 hash. For example:
 ```json
 {"request_id":"chatcmpl-abc123","client_id":"claims-app","client_name":"Claims application","on_behalf_of":"user-42","agent":"assistant","server":"http://mcp.internal/mcp","tool":"lookup_claim","decision":"allowed","outcome":"ok","error_kind":"","duration_ms":18,"args_sha256":"…","message":"MCP tool audit"}
 ```
+
+### Per-agent limits
+
+An agent may set `max_concurrent_requests` and `request_timeout_seconds` to restrict itself
+further than the server-wide values, so one slow or expensive agent cannot take every slot.
+Both are limits only: a value above the server-wide one is rejected at startup rather than
+silently ignored, and the stricter of the two always applies. A request needs a server-wide slot
+and an agent slot; if either is full it gets `503` with `Retry-After: 1`, and the message says
+which one. Both are held for the whole run, including a stream. An agent without these keys is
+bound only by the server-wide limits.
 
 ### Readiness
 

@@ -10,13 +10,13 @@ Candidate improvements for Riggate. This list captures ideas for discussion and 
 
 - [ ] Add per-target health checks for configured agents, including reachability, last success, latency, and recent errors.
 - [x] Add readiness reporting that distinguishes Riggate being alive from MCP servers being ready (`/readyz`). Provider reachability is not probed.
-- [x] Reconnect HTTP MCP servers whose connection closes, with the stdio backoff. Covered by the generic supervisor test; no test runs a real Streamable HTTP MCP server yet.
+- [x] Reconnect HTTP MCP servers whose connection closes, with the stdio backoff. A heartbeat detects a server that vanishes; tested against a real Streamable HTTP MCP server.
 - [ ] Expose operational metrics such as request count, latency, failures, concurrency, and token usage when available.
 
 ## Routing and controls
 
 - [ ] Add configurable fallback targets for provider or model failures.
-- [ ] Support per-agent concurrency and timeout limits in addition to server-wide limits.
+- [x] Support per-agent concurrency and timeout limits in addition to server-wide limits.
 
 ## Providers
 

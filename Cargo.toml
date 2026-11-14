@@ -41,3 +41,5 @@ url = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+rmcp = { version = "3.5", features = ["server", "transport-streamable-http-server"] }
+tokio-util = "0.7"

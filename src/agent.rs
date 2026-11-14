@@ -44,8 +44,18 @@ pub async fn with_audit_context<F: std::future::Future>(
 /// Every agent is built once at boot. Requests only borrow them.
 pub type Registry = Arc<AgentRegistry>;
 
+/// Limits that apply to one agent on top of the server-wide ones.
+#[derive(Clone, Default)]
+pub struct AgentLimits {
+    /// Present when `max_concurrent_requests` is set for the agent.
+    pub semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Present when `request_timeout_seconds` is set for the agent.
+    pub timeout: Option<std::time::Duration>,
+}
+
 pub struct AgentRegistry {
     agents: HashMap<String, Agent>,
+    limits: HashMap<String, AgentLimits>,
     /// One task per MCP server. Each owns its connection (and, for stdio, the child process),
     /// which must stay alive for registered tools to keep working.
     supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -98,6 +108,7 @@ impl AgentRegistry {
     fn bare(agents: HashMap<String, Agent>) -> Self {
         Self {
             agents,
+            limits: HashMap::new(),
             supervisors: Mutex::new(Vec::new()),
             stop: tokio::sync::watch::channel(false).0,
             health: Vec::new(),
@@ -127,6 +138,11 @@ impl AgentRegistry {
         self.agents.get(name)
     }
 
+    /// The agent's own limits; empty when it sets none.
+    pub fn limits(&self, name: &str) -> AgentLimits {
+        self.limits.get(name).cloned().unwrap_or_default()
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.agents.keys()
     }
@@ -139,6 +155,22 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
     match build_agents(configs, &stop_rx, &mut supervisors, &mut health).await {
         Ok(agents) => Ok(Arc::new(AgentRegistry {
             agents,
+            limits: configs
+                .iter()
+                .map(|cfg| {
+                    (
+                        cfg.name.clone(),
+                        AgentLimits {
+                            semaphore: cfg
+                                .max_concurrent_requests
+                                .map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+                            timeout: cfg
+                                .request_timeout_seconds
+                                .map(std::time::Duration::from_secs),
+                        },
+                    )
+                })
+                .collect(),
             supervisors: Mutex::new(supervisors),
             stop,
             health,
@@ -221,6 +253,7 @@ async fn build_agents(
                         &cfg.name,
                         stop_rx.clone(),
                         Backoff::default(),
+                        Heartbeat::from_config(server),
                         up.clone(),
                     )
                     .await
@@ -249,6 +282,25 @@ pub(crate) fn test_registry(base_url: &str) -> Registry {
     let mut agents = HashMap::new();
     agents.insert("mock".to_string(), agent);
     Arc::new(AgentRegistry::bare(agents))
+}
+
+/// [`test_registry`] with limits on its one agent, `mock`.
+#[cfg(test)]
+pub(crate) fn test_registry_with_limits(
+    base_url: &str,
+    max_concurrent: Option<usize>,
+    timeout: Option<std::time::Duration>,
+) -> Registry {
+    let mut registry = Arc::try_unwrap(test_registry(base_url))
+        .unwrap_or_else(|_| unreachable!("fresh registry has one owner"));
+    registry.limits.insert(
+        "mock".to_string(),
+        AgentLimits {
+            semaphore: max_concurrent.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+            timeout,
+        },
+    );
+    Arc::new(registry)
 }
 
 /// A registry that reports the given MCP server states, so readiness can be tested without
@@ -499,14 +551,15 @@ async fn start_stdio(
     .await
 }
 
-/// Same supervision for a Streamable HTTP server: a closed connection is reconnected with
-/// backoff instead of leaving its tools gone until the gateway restarts.
+/// Same supervision for a Streamable HTTP server: a connection that closes, or stops
+/// answering the heartbeat, is reconnected with backoff.
 async fn start_http(
     server: &McpServerConfig,
     tool_server: &rig::tool::server::ToolServerHandle,
     agent: &str,
     stop: tokio::sync::watch::Receiver<bool>,
     backoff: Backoff,
+    heartbeat: Option<Heartbeat>,
     ready: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let (server_cfg, tools, agent_name) = (server.clone(), tool_server.clone(), agent.to_string());
@@ -515,7 +568,14 @@ async fn start_http(
         server.display_name(),
         move || {
             let (server, tools, agent) = (server_cfg.clone(), tools.clone(), agent_name.clone());
-            async move { connect_mcp(&server, &tools, &agent).await.map(HttpSession) }
+            async move {
+                connect_mcp(&server, &tools, &agent)
+                    .await
+                    .map(|connection| HttpSession {
+                        connection,
+                        heartbeat,
+                    })
+            }
         },
         stop,
         backoff,
@@ -524,15 +584,71 @@ async fn start_http(
     .await
 }
 
-struct HttpSession(rig::tool::rmcp::McpConnection);
+/// How an HTTP server's liveness is checked. The rmcp client retries a lost connection
+/// internally and never reports it closed, so without this a server that went away would
+/// stay "ready" with its tools registered until a call happened to fail.
+#[derive(Clone, Copy, Debug)]
+pub struct Heartbeat {
+    pub interval: std::time::Duration,
+    pub timeout: std::time::Duration,
+    /// Consecutive failed checks before the server is declared gone.
+    pub failures: u32,
+}
+
+impl Heartbeat {
+    /// The server's configured heartbeat, or `None` when it is turned off
+    /// (`heartbeat_interval_seconds = 0`).
+    pub fn from_config(server: &McpServerConfig) -> Option<Heartbeat> {
+        let interval = server.heartbeat_interval_seconds.unwrap_or(15);
+        if interval == 0 {
+            return None;
+        }
+        Some(Heartbeat {
+            interval: std::time::Duration::from_secs(interval),
+            timeout: std::time::Duration::from_secs(server.heartbeat_timeout_seconds.unwrap_or(5)),
+            failures: 2,
+        })
+    }
+}
+
+struct HttpSession {
+    connection: rig::tool::rmcp::McpConnection,
+    /// `None` when checks are turned off; only a clean close is then noticed.
+    heartbeat: Option<Heartbeat>,
+}
+
+impl HttpSession {
+    /// Resolves once `failures` checks in a row have failed or timed out. A `tools/list`
+    /// is the probe: every MCP server implements it and it needs no extra permission.
+    async fn unresponsive(&self) {
+        let Some(heartbeat) = self.heartbeat else {
+            return std::future::pending().await;
+        };
+        let mut failed = 0;
+        loop {
+            tokio::time::sleep(heartbeat.interval).await;
+            let alive = matches!(
+                tokio::time::timeout(heartbeat.timeout, self.connection.tools()).await,
+                Ok(Ok(_))
+            );
+            failed = if alive { 0 } else { failed + 1 };
+            if failed >= heartbeat.failures {
+                return;
+            }
+        }
+    }
+}
 
 impl crate::supervise::Session for HttpSession {
     async fn closed(&mut self) {
-        self.0.closed().await;
+        tokio::select! {
+            _ = self.connection.closed() => {}
+            _ = self.unresponsive() => {}
+        }
     }
 
     async fn stop(self) {
-        self.0.close().await;
+        self.connection.close().await;
     }
 }
 
@@ -714,6 +830,7 @@ mod tests {
                 .collect(),
             inherit_env: inherit.iter().map(|s| s.to_string()).collect(),
             allowed_tools: None,
+            ..Default::default()
         }
     }
 
@@ -1067,6 +1184,7 @@ if os.environ.get("FAKE_STUBBORN"):
             env,
             inherit_env: vec![],
             allowed_tools: Some(vec!["*".to_string()]),
+            ..Default::default()
         };
         Fake { dir, server }
     }
@@ -1104,6 +1222,14 @@ if os.environ.get("FAKE_STUBBORN"):
             .into_iter()
             .map(|d| d.name.to_string())
             .collect()
+    }
+
+    fn fast_heartbeat() -> Heartbeat {
+        Heartbeat {
+            interval: std::time::Duration::from_millis(100),
+            timeout: std::time::Duration::from_millis(500),
+            failures: 2,
+        }
     }
 
     fn fast() -> Backoff {
@@ -1219,12 +1345,21 @@ if os.environ.get("FAKE_STUBBORN"):
             env: Default::default(),
             inherit_env: vec![],
             allowed_tools: Some(vec!["*".to_string()]),
+            ..Default::default()
         };
         let tools = rig::tool::server::ToolServer::new().run();
         let (_stop, stop_rx) = tokio::sync::watch::channel(false);
-        let err = start_http(&server, &tools, "a", stop_rx, fast(), flag())
-            .await
-            .unwrap_err();
+        let err = start_http(
+            &server,
+            &tools,
+            "a",
+            stop_rx,
+            fast(),
+            Some(fast_heartbeat()),
+            flag(),
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{err:#}").contains("MCP connection to"), "{err:#}");
     }
 
@@ -1321,5 +1456,249 @@ if os.environ.get("FAKE_STUBBORN"):
         stop.send(true).unwrap();
         handle.await.unwrap();
         let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    // --- a real Streamable HTTP MCP server, started and stopped on demand ---
+
+    use rig::tool::rmcp::rmcp as mcp;
+
+    #[derive(Clone)]
+    struct TimeServer;
+
+    impl mcp::ServerHandler for TimeServer {
+        fn get_info(&self) -> mcp::model::ServerConfig {
+            mcp::model::ServerConfig::new(
+                mcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<mcp::model::PaginatedRequestParams>,
+            _context: mcp::service::RequestContext<mcp::RoleServer>,
+        ) -> Result<mcp::model::ListToolsResult, mcp::ErrorData> {
+            let schema: mcp::model::JsonObject =
+                serde_json::from_value(serde_json::json!({"type": "object"})).unwrap();
+            Ok(mcp::model::ListToolsResult {
+                tools: vec![mcp::model::Tool::new("get_time", "the time", schema)],
+                ..Default::default()
+            })
+        }
+    }
+
+    struct HttpMcp {
+        cancel: tokio_util::sync::CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HttpMcp {
+        /// Serve on a fresh port. Binding port 0 here, rather than finding a free port and
+        /// binding it later, leaves no window for another test to take it.
+        async fn start_new() -> (HttpMcp, std::net::SocketAddr) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            (HttpMcp::serve(listener), addr)
+        }
+
+        /// Serve again on a port this test used before. The old socket may take a moment to
+        /// release, so retry the bind briefly instead of failing on the first `AddrInUse`.
+        async fn restart_on(addr: std::net::SocketAddr) -> HttpMcp {
+            for _ in 0..100 {
+                if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+                    return HttpMcp::serve(listener);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("could not rebind {addr}");
+        }
+
+        fn serve(listener: tokio::net::TcpListener) -> HttpMcp {
+            use mcp::transport::streamable_http_server::{
+                session::local::LocalSessionManager, StreamableHttpServerConfig,
+                StreamableHttpService,
+            };
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let service: StreamableHttpService<TimeServer, LocalSessionManager> =
+                StreamableHttpService::new(
+                    || Ok(TimeServer),
+                    Default::default(),
+                    StreamableHttpServerConfig::default()
+                        .with_sse_keep_alive(None)
+                        .with_cancellation_token(cancel.child_token()),
+                );
+            let app = axum::Router::new().nest_service("/mcp", service);
+            let token = cancel.clone();
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { token.cancelled_owned().await })
+                    .await;
+            });
+            HttpMcp { cancel, task }
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await;
+        }
+    }
+
+    fn http_server(addr: std::net::SocketAddr) -> McpServerConfig {
+        McpServerConfig {
+            url: Some(format!("http://{addr}/mcp")),
+            bearer_token_env: None,
+            command: None,
+            args: vec![],
+            working_dir: None,
+            env: Default::default(),
+            inherit_env: vec![],
+            allowed_tools: Some(vec!["*".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http_mcp_server_registers_its_tools_and_is_ready() {
+        let (upstream, addr) = HttpMcp::start_new().await;
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let up = flag();
+        let handle = start_http(
+            &http_server(addr),
+            &tools,
+            "a",
+            stop_rx,
+            fast(),
+            Some(fast_heartbeat()),
+            up.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(is_up(&up));
+        assert_eq!(tool_names(&tools).await, vec!["get_time"]);
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        assert!(!is_up(&up));
+        upstream.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_healthy_http_mcp_server_is_not_restarted_by_the_heartbeat() {
+        // Runs on the test thread's runtime, so the supervisor's log lines land in the capture.
+        let capture = crate::testlog::Capture::start();
+        let (upstream, addr) = HttpMcp::start_new().await;
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let up = flag();
+        let handle = start_http(
+            &http_server(addr),
+            &tools,
+            "a",
+            stop_rx,
+            fast(),
+            Some(fast_heartbeat()),
+            up.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Roughly ten heartbeats at 100 ms.
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        assert!(is_up(&up));
+        let logs = capture.logs();
+        assert!(
+            !logs.contains("restarting"),
+            "a healthy server was restarted:\n{logs}"
+        );
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        upstream.stop().await;
+    }
+
+    #[test]
+    fn heartbeat_follows_the_server_config_and_zero_turns_it_off() {
+        let mut server = http_server("127.0.0.1:1".parse().unwrap());
+        let default = Heartbeat::from_config(&server).unwrap();
+        assert_eq!(default.interval, std::time::Duration::from_secs(15));
+        assert_eq!(default.timeout, std::time::Duration::from_secs(5));
+        assert_eq!(default.failures, 2);
+
+        server.heartbeat_interval_seconds = Some(3);
+        server.heartbeat_timeout_seconds = Some(1);
+        let tuned = Heartbeat::from_config(&server).unwrap();
+        assert_eq!(tuned.interval, std::time::Duration::from_secs(3));
+        assert_eq!(tuned.timeout, std::time::Duration::from_secs(1));
+
+        server.heartbeat_interval_seconds = Some(0);
+        assert!(Heartbeat::from_config(&server).is_none());
+    }
+
+    #[tokio::test]
+    async fn with_the_heartbeat_off_a_vanished_http_server_is_not_noticed() {
+        // The documented cost of turning checks off: only a clean close is detected.
+        let (upstream, addr) = HttpMcp::start_new().await;
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let up = flag();
+        let handle = start_http(
+            &http_server(addr),
+            &tools,
+            "a",
+            stop_rx,
+            fast(),
+            None,
+            up.clone(),
+        )
+        .await
+        .unwrap();
+        upstream.stop().await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(
+            is_up(&up),
+            "with no heartbeat nothing reports the server gone"
+        );
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_http_mcp_server_that_goes_away_and_returns_is_reconnected() {
+        let (upstream, addr) = HttpMcp::start_new().await;
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let up = flag();
+        let handle = start_http(
+            &http_server(addr),
+            &tools,
+            "a",
+            stop_rx,
+            fast(),
+            Some(fast_heartbeat()),
+            up.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(is_up(&up));
+
+        upstream.stop().await;
+        wait_for("readiness to drop after the server went away", || {
+            !is_up(&up)
+        })
+        .await;
+
+        let upstream = HttpMcp::restart_on(addr).await;
+        wait_for("readiness to return after the server came back", || {
+            is_up(&up)
+        })
+        .await;
+        assert_eq!(tool_names(&tools).await, vec!["get_time"]);
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        upstream.stop().await;
     }
 }
