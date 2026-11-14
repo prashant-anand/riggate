@@ -46,21 +46,62 @@ pub type Registry = Arc<AgentRegistry>;
 
 pub struct AgentRegistry {
     agents: HashMap<String, Agent>,
-    // MCP services must stay alive for registered tools to keep working.
-    _mcp_services: Mutex<Vec<Box<dyn Send>>>,
-    /// One task per stdio MCP server; each owns a child process.
+    /// One task per MCP server. Each owns its connection (and, for stdio, the child process),
+    /// which must stay alive for registered tools to keep working.
     supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     stop: tokio::sync::watch::Sender<bool>,
+    /// One liveness check per configured MCP server.
+    health: Vec<ServerHealth>,
+    /// Set when shutdown begins, while requests are still draining.
+    draining: std::sync::atomic::AtomicBool,
+}
+
+/// Whether one MCP server is currently usable.
+struct ServerHealth {
+    ready: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// How many of the configured MCP servers are connected right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Readiness {
+    pub total: usize,
+    pub ready: usize,
+    pub draining: bool,
+}
+
+impl Readiness {
+    pub fn is_ready(&self) -> bool {
+        !self.draining && self.ready == self.total
+    }
 }
 
 impl AgentRegistry {
+    /// Ready means every configured MCP server is connected. Provider reachability is
+    /// deliberately not probed: that would spend tokens or fail on an air-gapped network for
+    /// reasons unrelated to whether this gateway can serve.
+    pub fn readiness(&self) -> Readiness {
+        Readiness {
+            total: self.health.len(),
+            ready: self.health.iter().filter(|h| (h.ready)()).count(),
+            draining: self.draining.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Report not-ready from now on, so a load balancer stops sending traffic while in-flight
+    /// requests finish. Servers keep running until [`AgentRegistry::shutdown`].
+    pub fn begin_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     fn bare(agents: HashMap<String, Agent>) -> Self {
         Self {
             agents,
-            _mcp_services: Mutex::new(Vec::new()),
             supervisors: Mutex::new(Vec::new()),
             stop: tokio::sync::watch::channel(false).0,
+            health: Vec::new(),
+            draining: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -93,14 +134,15 @@ impl AgentRegistry {
 
 pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
-    let mut mcp_services: Vec<Box<dyn Send>> = Vec::new();
     let mut supervisors: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    match build_agents(configs, &stop_rx, &mut mcp_services, &mut supervisors).await {
+    let mut health: Vec<ServerHealth> = Vec::new();
+    match build_agents(configs, &stop_rx, &mut supervisors, &mut health).await {
         Ok(agents) => Ok(Arc::new(AgentRegistry {
             agents,
-            _mcp_services: Mutex::new(mcp_services),
             supervisors: Mutex::new(supervisors),
             stop,
+            health,
+            draining: std::sync::atomic::AtomicBool::new(false),
         })),
         Err(error) => {
             // A later agent failed after earlier ones already spawned children. Do not leave
@@ -115,8 +157,8 @@ pub async fn build(configs: &[AgentConfig]) -> Result<Registry> {
 async fn build_agents(
     configs: &[AgentConfig],
     stop_rx: &tokio::sync::watch::Receiver<bool>,
-    mcp_services: &mut Vec<Box<dyn Send>>,
     supervisors: &mut Vec<tokio::task::JoinHandle<()>>,
+    health: &mut Vec<ServerHealth>,
 ) -> Result<HashMap<String, Agent>> {
     let mut agents = HashMap::new();
 
@@ -161,25 +203,32 @@ async fn build_agents(
                         cfg.name
                     )
                 };
-                if server.command.is_some() {
-                    supervisors.push(
-                        start_stdio(
-                            server,
-                            &tool_server,
-                            &cfg.name,
-                            stop_rx.clone(),
-                            Backoff::default(),
-                        )
-                        .await
-                        .with_context(context)?,
-                    );
+                let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let started = if server.command.is_some() {
+                    start_stdio(
+                        server,
+                        &tool_server,
+                        &cfg.name,
+                        stop_rx.clone(),
+                        Backoff::default(),
+                        up.clone(),
+                    )
+                    .await
                 } else {
-                    mcp_services.push(
-                        connect_mcp(server, &tool_server, &cfg.name)
-                            .await
-                            .with_context(context)?,
-                    );
-                }
+                    start_http(
+                        server,
+                        &tool_server,
+                        &cfg.name,
+                        stop_rx.clone(),
+                        Backoff::default(),
+                        up.clone(),
+                    )
+                    .await
+                };
+                supervisors.push(started.with_context(context)?);
+                health.push(ServerHealth {
+                    ready: Box::new(move || up.load(std::sync::atomic::Ordering::SeqCst)),
+                });
             }
             builder = builder.tool_server_handle(tool_server);
         }
@@ -200,6 +249,24 @@ pub(crate) fn test_registry(base_url: &str) -> Registry {
     let mut agents = HashMap::new();
     agents.insert("mock".to_string(), agent);
     Arc::new(AgentRegistry::bare(agents))
+}
+
+/// A registry that reports the given MCP server states, so readiness can be tested without
+/// running servers. Each flag stands for one configured server.
+#[cfg(test)]
+pub(crate) fn test_registry_with_servers(
+    base_url: &str,
+    servers: Vec<Arc<std::sync::atomic::AtomicBool>>,
+) -> Registry {
+    let mut registry = Arc::try_unwrap(test_registry(base_url))
+        .unwrap_or_else(|_| unreachable!("fresh registry has one owner"));
+    registry.health = servers
+        .into_iter()
+        .map(|up| ServerHealth {
+            ready: Box::new(move || up.load(std::sync::atomic::Ordering::SeqCst)),
+        })
+        .collect();
+    Arc::new(registry)
 }
 
 /// Like [`test_registry`], but the agent owns a tool server holding one permitted tool,
@@ -292,7 +359,7 @@ async fn connect_mcp(
     server: &McpServerConfig,
     tool_server: &rig::tool::server::ToolServerHandle,
     agent: &str,
-) -> Result<Box<dyn Send>> {
+) -> Result<rig::tool::rmcp::McpConnection> {
     use rig::tool::rmcp::rmcp::transport::StreamableHttpClientTransport;
 
     let name = server.display_name();
@@ -310,7 +377,7 @@ async fn connect_mcp(
         .connect(transport)
         .await
         .with_context(|| format!("MCP connection to {name} failed"))?;
-    Ok(Box::new(connection))
+    Ok(connection)
 }
 
 /// A running stdio server: the MCP connection and the process behind it.
@@ -374,28 +441,30 @@ async fn connect_stdio_once(
     }
 }
 
-/// Start supervising a stdio server and wait for its first handshake, so the gateway does
-/// not begin serving with a tool server that never came up.
-async fn start_stdio(
-    server: &McpServerConfig,
-    tool_server: &rig::tool::server::ToolServerHandle,
+/// Start supervising a server and wait for its first handshake, so the gateway does not
+/// begin serving with a tool server that never came up. After that, exits are retried.
+async fn start_supervised<S, F, Fut>(
     agent: &str,
+    name: String,
+    connect: F,
     stop: tokio::sync::watch::Receiver<bool>,
     backoff: Backoff,
-) -> Result<tokio::task::JoinHandle<()>> {
+    ready: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<tokio::task::JoinHandle<()>>
+where
+    S: crate::supervise::Session + Send + 'static,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<S>> + Send + 'static,
+{
     let (first_tx, first_rx) = tokio::sync::oneshot::channel();
-    let (server_cfg, tools, agent_name) = (server.clone(), tool_server.clone(), agent.to_string());
-    let name = server.display_name();
     let handle = tokio::spawn(crate::supervise::supervise(
         agent.to_string(),
         name,
-        move || {
-            let (server, tools, agent) = (server_cfg.clone(), tools.clone(), agent_name.clone());
-            async move { connect_stdio_once(&server, &tools, &agent).await }
-        },
+        connect,
         stop,
         first_tx,
         backoff,
+        ready,
     ));
     match first_rx.await {
         Ok(Ok(())) => Ok(handle),
@@ -403,7 +472,67 @@ async fn start_stdio(
             let _ = handle.await;
             Err(error)
         }
-        Err(_) => anyhow::bail!("stdio MCP supervisor ended before the first connection"),
+        Err(_) => anyhow::bail!("MCP supervisor ended before the first connection"),
+    }
+}
+
+async fn start_stdio(
+    server: &McpServerConfig,
+    tool_server: &rig::tool::server::ToolServerHandle,
+    agent: &str,
+    stop: tokio::sync::watch::Receiver<bool>,
+    backoff: Backoff,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let (server_cfg, tools, agent_name) = (server.clone(), tool_server.clone(), agent.to_string());
+    start_supervised(
+        agent,
+        server.display_name(),
+        move || {
+            let (server, tools, agent) = (server_cfg.clone(), tools.clone(), agent_name.clone());
+            async move { connect_stdio_once(&server, &tools, &agent).await }
+        },
+        stop,
+        backoff,
+        ready,
+    )
+    .await
+}
+
+/// Same supervision for a Streamable HTTP server: a closed connection is reconnected with
+/// backoff instead of leaving its tools gone until the gateway restarts.
+async fn start_http(
+    server: &McpServerConfig,
+    tool_server: &rig::tool::server::ToolServerHandle,
+    agent: &str,
+    stop: tokio::sync::watch::Receiver<bool>,
+    backoff: Backoff,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let (server_cfg, tools, agent_name) = (server.clone(), tool_server.clone(), agent.to_string());
+    start_supervised(
+        agent,
+        server.display_name(),
+        move || {
+            let (server, tools, agent) = (server_cfg.clone(), tools.clone(), agent_name.clone());
+            async move { connect_mcp(&server, &tools, &agent).await.map(HttpSession) }
+        },
+        stop,
+        backoff,
+        ready,
+    )
+    .await
+}
+
+struct HttpSession(rig::tool::rmcp::McpConnection);
+
+impl crate::supervise::Session for HttpSession {
+    async fn closed(&mut self) {
+        self.0.closed().await;
+    }
+
+    async fn stop(self) {
+        self.0.close().await;
     }
 }
 
@@ -773,57 +902,10 @@ mod tests {
         assert!(!catalog.contains("delete"));
     }
 
-    /// Captures what `tracing` actually emits.
-    ///
-    /// The security claim is "a denied tool is visible in the log", and a test that only
-    /// inspects the tool catalog cannot see a log line at all. `tracing` caches callsite
-    /// interest globally, so a callsite first evaluated while no subscriber was installed
-    /// can stay permanently disabled and the assertion would fail on a test-ordering
-    /// accident. `rebuild_interest_cache` is the documented reset, and it only takes effect
-    /// inside the subscriber's scope, so it is called there.
-    fn capture_logs(f: impl FnOnce()) -> String {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for Buffer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("log buffer is not poisoned")
-                    .extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-            type Writer = Buffer;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buffer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f();
-        });
-
-        let captured = buffer.0.lock().expect("log buffer is not poisoned").clone();
-        String::from_utf8_lossy(&captured).into_owned()
-    }
+    /// Captures what `tracing` actually emits. The security claim is "a denied tool is
+    /// visible in the log", and a test that only inspects the tool catalog cannot see a log
+    /// line at all. See `testlog` for why this does not use a per-test subscriber.
+    use crate::testlog::capture_logs;
 
     const TEST_SERVER: &str = "http://mcp.internal:8931/mcp";
 
@@ -1037,7 +1119,7 @@ if os.environ.get("FAKE_STUBBORN"):
         let f = fake("shutdown", false);
         let tools = rig::tool::server::ToolServer::new().run();
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
-        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast(), Default::default())
             .await
             .unwrap();
         assert_eq!(tool_names(&tools).await, vec!["get_time"]);
@@ -1055,7 +1137,7 @@ if os.environ.get("FAKE_STUBBORN"):
         let f = fake("restart", true);
         let tools = rig::tool::server::ToolServer::new().run();
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
-        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast(), Default::default())
             .await
             .unwrap();
 
@@ -1076,13 +1158,83 @@ if os.environ.get("FAKE_STUBBORN"):
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 
+    fn flag() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    fn is_up(up: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+        up.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn stdio_readiness_is_up_while_running_and_down_once_stopped() {
+        let f = fake("ready-steady", false);
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let up = flag();
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast(), up.clone())
+            .await
+            .unwrap();
+        assert!(is_up(&up), "ready as soon as start_stdio returns");
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        assert!(!is_up(&up), "not ready once stopped");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn stdio_readiness_drops_while_a_crashed_server_is_restarting() {
+        // The fake dies right after its handshake, so readiness is only observed to change,
+        // never asserted at a fixed instant. The 600 ms backoff keeps the down window wide.
+        let f = fake("ready-crash", true);
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let up = flag();
+        let slow = Backoff {
+            base: std::time::Duration::from_millis(600),
+            max: std::time::Duration::from_millis(600),
+            healthy_after: std::time::Duration::from_secs(60),
+        };
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, slow, up.clone())
+            .await
+            .unwrap();
+
+        wait_for("the crash to be noticed", || !is_up(&up)).await;
+        wait_for("the restart to be ready", || is_up(&up)).await;
+
+        stop.send(true).unwrap();
+        handle.await.unwrap();
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_http_server_still_fails_startup() {
+        let server = McpServerConfig {
+            url: Some("http://127.0.0.1:1/mcp".to_string()),
+            bearer_token_env: None,
+            command: None,
+            args: vec![],
+            working_dir: None,
+            env: Default::default(),
+            inherit_env: vec![],
+            allowed_tools: Some(vec!["*".to_string()]),
+        };
+        let tools = rig::tool::server::ToolServer::new().run();
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let err = start_http(&server, &tools, "a", stop_rx, fast(), flag())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("MCP connection to"), "{err:#}");
+    }
+
     #[tokio::test]
     async fn a_missing_command_fails_startup_instead_of_serving_without_it() {
         let mut server = fake("missing", false).server;
         server.command = Some("/nonexistent/riggate-mcp".to_string());
         let tools = rig::tool::server::ToolServer::new().run();
         let (_stop, stop_rx) = tokio::sync::watch::channel(false);
-        let err = start_stdio(&server, &tools, "a", stop_rx, fast())
+        let err = start_stdio(&server, &tools, "a", stop_rx, fast(), Default::default())
             .await
             .unwrap_err();
         assert!(
@@ -1100,7 +1252,7 @@ if os.environ.get("FAKE_STUBBORN"):
             .insert("FAKE_STUBBORN".into(), marker.display().to_string());
         let tools = rig::tool::server::ToolServer::new().run();
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
-        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast(), Default::default())
             .await
             .unwrap();
         let pid = starts(&f.dir)[0];
@@ -1126,7 +1278,7 @@ if os.environ.get("FAKE_STUBBORN"):
             .insert("FAKE_GRANDCHILD".into(), gc_file.display().to_string());
         let tools = rig::tool::server::ToolServer::new().run();
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
-        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast(), Default::default())
             .await
             .unwrap();
         let gc: u32 = std::fs::read_to_string(&gc_file)
@@ -1154,7 +1306,7 @@ if os.environ.get("FAKE_STUBBORN"):
             .insert("FAKE_GRANDCHILD".into(), gc_file.display().to_string());
         let tools = rig::tool::server::ToolServer::new().run();
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
-        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast())
+        let handle = start_stdio(&f.server, &tools, "a", stop_rx, fast(), Default::default())
             .await
             .unwrap();
         let first_gc: u32 = std::fs::read_to_string(&gc_file)

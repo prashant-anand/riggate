@@ -6,6 +6,10 @@
 
 use anyhow::Result;
 use std::future::Future;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{oneshot, watch};
@@ -65,6 +69,7 @@ pub async fn supervise<S, F, Fut>(
     mut shutdown: watch::Receiver<bool>,
     first: oneshot::Sender<Result<()>>,
     backoff: Backoff,
+    ready: Arc<AtomicBool>,
 ) where
     S: Session,
     F: FnMut() -> Fut,
@@ -79,6 +84,7 @@ pub async fn supervise<S, F, Fut>(
                 if let Some(tx) = first.take() {
                     let _ = tx.send(Ok(()));
                 }
+                ready.store(true, Ordering::SeqCst);
                 tracing::info!(agent = %agent, server = %server, "stdio MCP server ready");
                 let shutting_down = tokio::select! {
                     _ = session.closed() => {
@@ -87,6 +93,7 @@ pub async fn supervise<S, F, Fut>(
                     }
                     _ = stopped(&mut shutdown) => true,
                 };
+                ready.store(false, Ordering::SeqCst);
                 // Dropping the connection retires its tools before the next ones register,
                 // and the sweep kills anything the dead server left running.
                 session.stop().await;
@@ -173,6 +180,81 @@ mod tests {
         async fn stop(self) {}
     }
 
+    /// A session that "dies" after `lifetime`, or never if `None`. Counts how many were made.
+    struct Timed {
+        lifetime: Option<Duration>,
+        stopped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Session for Timed {
+        async fn closed(&mut self) {
+            match self.lifetime {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending().await,
+            }
+        }
+        async fn stop(self) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_is_reconnected_and_readiness_follows() {
+        use std::sync::atomic::AtomicUsize;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tx, rx) = oneshot::channel();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (c, st) = (connects.clone(), stopped.clone());
+        let task = tokio::spawn(supervise(
+            "a".into(),
+            "s".into(),
+            move || {
+                // The first two sessions die quickly; the third stays up.
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                let lifetime = (n < 2).then(|| Duration::from_millis(30));
+                let stopped = st.clone();
+                async move { Ok::<_, anyhow::Error>(Timed { lifetime, stopped }) }
+            },
+            stop_rx,
+            tx,
+            Backoff {
+                base: Duration::from_millis(10),
+                max: Duration::from_millis(20),
+                healthy_after: Duration::from_secs(60),
+            },
+            ready.clone(),
+        ));
+        rx.await.unwrap().unwrap();
+        for _ in 0..200 {
+            if connects.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(connects.load(Ordering::SeqCst), 3);
+        // Give the third connect a moment to publish readiness, then it must hold.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "ready while the third session is up"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            3,
+            "a healthy session is not restarted"
+        );
+
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(
+            stopped.load(Ordering::SeqCst),
+            3,
+            "every session is stopped, dead or alive"
+        );
+    }
+
     #[tokio::test]
     async fn first_connect_failure_is_reported_and_not_retried() {
         let (_stop_tx, stop_rx) = watch::channel(false);
@@ -189,41 +271,19 @@ mod tests {
             stop_rx,
             tx,
             Backoff::default(),
+            Default::default(),
         )
         .await;
         assert!(rx.await.unwrap().unwrap_err().to_string().contains("boom"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[derive(Clone, Default)]
-    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Capture {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-        type Writer = Capture;
-        fn make_writer(&'a self) -> Capture {
-            self.clone()
-        }
-    }
-
     #[tokio::test]
     async fn stderr_lines_are_logged_with_attribution_and_cannot_forge_log_lines() {
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let capture = crate::testlog::Capture::start();
         let input = b"hello\nfake line\x1b[31m\nINFO forged\n";
         forward_stderr(&input[..], "agent1".into(), "stdio:x".into()).await;
-        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let out = capture.logs();
         assert!(out.contains("agent1") && out.contains("stdio:x"), "{out}");
         assert!(out.contains("hello"), "{out}");
         assert!(

@@ -78,7 +78,7 @@ default; set `strict_requests = true` to reject them. Invalid option values retu
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/healthz` | Liveness check; does not require authentication |
-| `GET` | `/readyz` | Startup readiness; does not require authentication |
+| `GET` | `/readyz` | Readiness: `200` when every configured MCP server is connected, `503` otherwise; does not require authentication |
 | `GET` | `/v1/models` | Lists configured agents |
 | `POST` | `/v1/chat/completions` | Runs an agent |
 
@@ -214,6 +214,18 @@ arguments are represented only by their SHA-256 hash. For example:
 ```json
 {"request_id":"chatcmpl-abc123","client_id":"claims-app","client_name":"Claims application","on_behalf_of":"user-42","agent":"assistant","server":"http://mcp.internal/mcp","tool":"lookup_claim","decision":"allowed","outcome":"ok","error_kind":"","duration_ms":18,"args_sha256":"…","message":"MCP tool audit"}
 ```
+
+### Readiness
+
+`/healthz` says the process is alive; `/readyz` says it can do its job. Ready means every
+configured MCP server is currently connected, for stdio servers including after a restart, and
+the answer changes as servers drop and return. The body is
+`{"status":"ready","mcp_servers":{"total":2,"ready":2}}`, with status `503` and `"not_ready"` when
+any are down. When shutdown begins it turns `503` with `"shutting_down"` immediately, before
+in-flight requests have drained, so a load balancer stops sending traffic first. Because the probe is unauthenticated it reports counts only; the log names the
+server that is down. Providers are not probed, since that would spend tokens or depend on the
+network; a provider outage shows up as `502` on requests. An HTTP MCP server whose connection
+closes is not reconnected, so it stays unready until Riggate restarts.
 
 ### Stdio MCP servers
 

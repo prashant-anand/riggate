@@ -159,6 +159,7 @@ pub fn router_with_clients(
         timeout: limits.timeout,
         strict_requests: limits.strict_requests,
     };
+    let probe_state = agents.clone();
     let api = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
@@ -175,7 +176,7 @@ pub fn router_with_clients(
 
     Router::new()
         .route("/healthz", get(health))
-        .route("/readyz", get(readiness))
+        .route("/readyz", get(readiness).with_state(probe_state))
         .merge(api)
 }
 
@@ -183,10 +184,27 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Readiness is only exposed after configuration, providers, and MCP connections have been
-/// initialized. It does not make live requests to providers; use `/healthz` for liveness.
-async fn readiness() -> Json<Value> {
-    Json(json!({"status": "ready"}))
+/// Ready when every configured MCP server is connected: `200` if so, `503` otherwise. The
+/// probe is unauthenticated, so it reports counts only; which server is down is in the logs.
+/// Providers are not probed (see `AgentRegistry::readiness`); `/healthz` is liveness.
+async fn readiness(State(agents): State<Registry>) -> (StatusCode, Json<Value>) {
+    let r = agents.readiness();
+    let status = if r.draining {
+        "shutting_down"
+    } else if r.is_ready() {
+        "ready"
+    } else {
+        "not_ready"
+    };
+    let code = if r.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(json!({"status": status, "mcp_servers": {"total": r.total, "ready": r.ready}})),
+    )
 }
 
 /// Advertises configured agents in the OpenAI `/v1/models` shape, so existing
@@ -988,6 +1006,74 @@ mod tests {
             completion_finish_reason(Some(FinishReason::Stop), Some(4), Some(5)),
             "stop"
         );
+    }
+
+    #[tokio::test]
+    async fn readyz_is_unavailable_while_any_mcp_server_is_down_and_reports_only_counts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let up = Arc::new(AtomicBool::new(true));
+        let down = Arc::new(AtomicBool::new(false));
+        let registry = crate::agent::test_registry_with_servers(
+            "http://127.0.0.1:1/v1",
+            vec![up.clone(), down.clone()],
+        );
+        let app = router(
+            registry,
+            Some("test-token".into()),
+            RequestLimits::default(),
+        );
+        let probe = |app: Router| async move {
+            let response = app
+                .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        };
+
+        let (status, body) = probe(app.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["mcp_servers"], json!({"total": 2, "ready": 1}));
+
+        down.store(true, Ordering::SeqCst);
+        let (status, body) = probe(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+
+        up.store(false, Ordering::SeqCst);
+        let (status, _) = probe(app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readyz_fails_as_soon_as_shutdown_begins_even_with_every_server_up() {
+        let registry = crate::agent::test_registry("http://127.0.0.1:1/v1");
+        let app = router(
+            registry.clone(),
+            Some("test-token".into()),
+            RequestLimits::default(),
+        );
+        let probe = |app: Router| async move {
+            let response = app
+                .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        };
+        assert_eq!(probe(app.clone()).await.0, StatusCode::OK);
+
+        registry.begin_drain();
+        let (status, body) = probe(app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "shutting_down");
     }
 
     #[tokio::test]
